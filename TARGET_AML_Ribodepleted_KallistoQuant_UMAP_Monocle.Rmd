@@ -1,0 +1,474 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq"
+author: "Jenny Smith"
+date: "1/26/19"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+```
+
+```{r message=FALSE}
+# 
+# library(seqGlue)
+# library(apeglm)
+
+library(ggplot2)
+library(ggrepel)
+library(gridExtra)
+library(RColorBrewer)
+# library(randomcoloR)
+
+library(readxl)
+library(readr)
+library(pheatmap)
+
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(tools)
+
+
+# library(m3addon)
+library(DeGSEA)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS,"survival_analysis/Survplot_Functions_2018.10.24.r"))
+```
+
+
+#Read in the Clinical Data
+
+```{r message=FALSE, warning=FALSE}
+merged <- read_csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_2.12.20.csv"))
+
+merged <- merged %>%
+  filter(USI != "Unknown")
+
+dim(merged)
+```
+
+
+#Manifest Files
+
+```{r}
+sample_metadata <- read.csv("0000_Archive/TARGET_AML_Ribodepleted_Master_Manifest_Kallisto.csv") %>% 
+  select(USI,Sample, Group,Batch,Protocol) %>%
+  mutate(Colname=ifelse(grepl("dx1|dx2",Batch),USI,Sample)) %>% 
+  
+  #udpate in the clinical covariates
+  left_join(., select(merged, everything(), -Group), 
+            by="USI") %>%
+  mutate_at(vars(Protocol.y,Protocol.x),
+            ~ifelse(is.na(.), "", .)) %>%
+  unite(col=Protocol, matches("^Protocol"), sep="", remove=T) %>% 
+  
+  #Tissue and DX/rlps Columns
+  mutate(Time_point=case_when(
+          grepl("03A|09A",Sample) & Group != "CellLine" & Group != "FlowSorted"  ~ "diagnostic",
+          grepl("40A|04A" , Sample) & Group != "CellLine" & Group != "FlowSorted"  ~ "relapse",
+          TRUE ~ Group),
+        Tissue=case_when(
+          grepl("03A",Sample) & Group != "CellLine" & Group != "FlowSorted"  ~ "peripheral_blood",
+          grepl("09A",Sample) & Group != "CellLine" & Group != "FlowSorted"  ~"bone_marrow",
+          grepl("04A", Sample) & Group != "CellLine" & Group != "FlowSorted"  ~ "peripheral_blood",
+          grepl("40A", Sample) & Group != "CellLine" & Group != "FlowSorted"  ~ "bone_marrow",
+          TRUE ~ Group)) %>%
+
+  #Primary Fusions
+  group_by(Primary.Fusion.CNV) %>%
+  mutate(N=n()) %>%
+  ungroup() %>%
+  mutate(AML_Subtype=case_when(
+          grepl("CBFA2T3-GLIS2",Primary.Fusion.CNV) | grepl("CBFA2T3-GLIS2",Additional.Fusions.CNV)  ~ "CBFA2T3-GLIS2",
+          grepl("NUP98-NSD1",Primary.Fusion.CNV) | grepl("NUP98-NSD1",Additional.Fusions.CNV) ~ "NUP98-NSD1",
+          grepl("NUP98-KDM5A",Primary.Fusion.CNV) | grepl("NUP98-KDM5A",Additional.Fusions.CNV)~ "NUP98-KDM5A",
+          grepl("KMT2A",Primary.Fusion.CNV) | grepl("KMT2A",Additional.Fusions.CNV)~ "KMT2A",
+          grepl("CBFB-MYH11",Primary.Fusion.CNV) | grepl("CBFB-MYH11",Additional.Fusions.CNV)~"CBFB-MYH11",
+          grepl("RUNX1-RUNX1T1",Primary.Fusion.CNV) | grepl("RUNX1-RUNX1T1",Additional.Fusions.CNV)~"RUNX1-RUNX1T1",
+          grepl("None",Primary.Fusion.CNV) ~ "No.Primary.Fusion.CNV",
+          !is.na(Primary.Fusion.CNV) & N >= 10 ~ Primary.Fusion.CNV,
+          TRUE ~ Group)) %>%
+  select(USI, Reg.,Protocol,
+                Group,Batch,Sample,Colname, AML_Subtype,
+                Age.in.years,ISCN,contains("fish"),
+                M7_AML,M6_AML,NPM.mutation.,
+                CEBPA.mutation.,
+                Rare.Fusions,Final.Risk.Group,
+                Cyto.Fusion.Molecular.Risk,
+                Primary.Fusion.CNV,Additional.Fusions.CNV,
+                Bone.marrow.leukemic.blast.percentage....,
+                Peripheral.blasts....,
+                Blast.percent..by.flow.,
+                everything()) %>%
+  as.data.frame() 
+
+                      
+# head(sample_metadata)
+dim(sample_metadata) #22345  151
+# write.csv(sample_metadata,
+#           "TARGET_AML_Ribodepleted_Master_Manifest_Kallisto_2.21.20.csv",
+#           row.names = F)
+```
+
+#Colors for Plotting
+
+```{r}
+col2hex <- function(col, alpha) rgb(t(col2rgb(col)), 
+                                    alpha=alpha, maxColorValue=255)
+SFtheme<-theme_bw() +
+    theme(legend.background = element_rect(fill = "transparent",colour = NA),
+          plot.background = element_rect(fill = "transparent",colour = NA),
+          panel.background = element_rect(fill = "transparent",colour = NA),
+          legend.key = element_rect(fill = "transparent",colour = NA),
+    axis.text.x=element_text(angle=90, hjust=0.95,vjust=0.2))
+```
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+
+barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+```{r fig.height=4}
+Cols <- c("Group","Batch", "AML_Subtype", "Time_point","Tissue","Mutations.Category")
+cc <- colorCodes_aheatmap(df=filter(sample_metadata, Group != "CellLine",
+                                    Group != "FlowSorted") %>% 
+                            select(Cols))
+
+
+#Manually Update AML subtype colors
+cc <- lapply(cc, function(x){x[["AML"]] <- "grey80"; return(x)})
+cc <- lapply(cc, function(x){x[["NBM"]] <- "white"; return(x)})
+cc$AML_Subtype[["No.Primary.Fusion.CNV"]] <- "azure4"
+cc$AML_Subtype[["RUNX1-RUNX1T1"]] <- "sienna4"
+cc$AML_Subtype[["CBFB-MYH11"]] <- "red"
+cc$AML_Subtype[["KMT2A"]] <- "khaki2"
+cc$AML_Subtype[["MPN"]] <- "yellow4"
+cc$AML_Subtype[["NUP98-KDM5A"]] <- "magenta"
+cc$AML_Subtype[["NUP98-NSD1"]] <- "steelblue1"
+cc$AML_Subtype[["TMD"]] <- "green4"
+
+
+
+# par(mar=c(12,4,4,2))
+barplot(rep(1,length(cc$Mutations.Category)), 
+        col=cc$Mutations.Category,
+        names.arg=names(cc$Mutations.Category),las=2)
+barplot(rep(1,length(cc$AML_Subtype)), 
+        col=cc$AML_Subtype,
+        names.arg=names(cc$AML_Subtype),las=2)
+```
+
+#Read in the gene annotations
+
+```{r}
+anno <- read.csv(file.path(HOME,"0000.00.02_Reference_GeneInfo/gencode.v29_RepBase.v24.01_GeneLevel_IDmap_anno.csv")) %>% 
+  set_rownames(.$gene_id)
+
+head(anno[,1:5])
+dim(anno)
+```
+
+
+#Read in the counts data
+
+```{r message=FALSE}
+kcts_dx <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+colnames(kcts_dx) <- gsub("-","\\.",colnames(kcts_dx)) %>% 
+  gsub("_RBS", "",.)
+
+rownames(kcts_dx) <- str_split_fixed(rownames(kcts_dx), "\\|", n=3)[,1]
+
+dim(kcts_dx) #59853  1462
+head(kcts_dx[,1:5])
+```
+
+```{r message=FALSE}
+kcts_ds <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_DSAML_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+
+colnames(kcts_ds) <- gsub("-","\\.",colnames(kcts_ds)) %>% 
+  gsub("_RBS", "",.)
+
+dim(kcts_ds) #207826    228
+head(kcts_ds[,1:5])
+```
+
+```{r}
+kcts_rlps <- readRDS(file.path(HOME,"0000.00.03_Expression_Matrices/TARGET_AML_RBD_Relapse_Kallisto_Quant_GeneLevel_scaledTPM_counts.RDS"))
+
+colnames(kcts_rlps) <- gsub("-","\\.",colnames(kcts_rlps)) %>%  
+  gsub("_RBS", "",.)
+
+head(kcts_rlps[,1:5])
+dim(kcts_rlps) #59853   543
+```
+
+```{r}
+identical(rownames(kcts_dx), rownames(kcts_ds))
+identical(rownames(kcts_dx), rownames(kcts_rlps))
+```
+
+```{r}
+cts <- cbind(kcts_dx, kcts_ds,kcts_rlps)
+sampleCols <- intersect(sample_metadata$Colname, colnames(cts)) #2,232
+rownames(cts) <- gsub("\\.[0-9]{1,2}$", "",rownames(cts))
+
+
+# saveRDS(cts, "TARGET_RBD_FullMatrix_GeneLevel_scaledTPM_counts.RDS")
+# cts <- as.matrix(cts[rowSums(cts >= 10) >= 0.05, sampleCols]) 
+dim(cts) 
+rm(kcts_dx, kcts_ds, kcts_rlps)
+```
+
+```{r}
+order <- match(rownames(cts), rownames(anno)) 
+anno <- anno[order,]
+anno$gene_short_name <- anno$gene_name
+identical(rownames(anno), rownames(cts))
+# any(is.na(rownames(anno))) #No missing
+```
+
+
+#Subset the Counts
+
+```{r}
+#removing TARGET.20.PAXLWH.CD34NEG.01R and other associated experimenal samples
+mdat.subset <- sample_metadata %>% 
+  filter(Group != "CellLine", 
+        Group != "FlowSorted",
+        !grepl("Replicate", Sample),
+        !grepl("relapse", Time_point),
+        !grepl("rlps", Batch),
+        !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample)) %>%
+  filter(Colname %in% colnames(cts)) %>%
+  mutate(Batch=factor(Batch, levels=c("dx1","dx2","ds1")),
+         AML_Subtype=factor(gsub("-","\\.", AML_Subtype),
+                            levels=c("NBM","AML","No.Primary.Fusion.CNV",
+                                      "TMD", "DS",
+                                     "KMT2A","NUP98.NSD1","CBFB.MYH11","RUNX1.RUNX1T1",
+                                     "monosomy7","RUNX1.CBFA2T3","DEK.NUP214", "del5q",
+                                     "NUP98.KDM5A","KAT6A.CREBBP",
+                                     "CBFA2T3.GLIS2","ETV6.MNX1",
+                                     "FUS.ERG","ERG.HNRNPH1", "RBM15.MKL1"))) %>%
+  set_rownames(.$Colname)
+  
+samps <- mdat.subset$Colname
+
+dim(mdat.subset) #1681  152
+```
+
+```{r}
+cts.subset <- cts[,samps]
+dim(cts.subset)
+
+identical(rownames(anno), rownames(cts.subset))
+```
+
+
+#Monocle3 workflow
+
+```{r}
+# BiocManager::install(c( 'SingleCellExperiment',
+#                         'batchelor'))
+
+#https://cran.r-project.org/src/contrib/Archive/Matrix.utils/
+# install.packages(file.path(SCRATCH,"jlsmith3/Matrix.utils_0.9.7.tar.gz"), repos = NULL, type="source")
+
+# devtools::install_github('cole-trapnell-lab/monocle3')
+```
+
+```{r}
+library(monocle3)
+library(DESeq2)
+```
+
+
+#Data set objects
+
+```{r}
+cds <- new_cell_data_set(cts.subset, 
+                         cell_metadata=mdat.subset,
+                         gene_metadata=anno)
+
+cds
+```
+
+```{r}
+#"mean-geometric-mean-total"
+#NOrmalize counts by the geometic mean of the total counts(reads) in the dataset per sample
+cell_total <- apply(cts.subset, 2, sum)
+geomean <- exp(mean(log(cell_total)))
+sf <- cell_total/geomean
+
+head(sf)
+colData(cds)[1:5,"Size_Factor"]
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = round(cts.subset, digits = 0), 
+                              colData = mdat.subset,
+                              design = ~AML_Subtype )
+# class(dds)
+#This function estimates the size factors using the "median ratio method" described by Equation 5 in Anders and Huber (2010). It divides each sample's gene expression value for each gene by the geometic mean of that gene's expression across all samples. Then for a sample the median in the vector of ratios of geneExp/geoMean is the size factor. 
+dds <- DESeq2::estimateSizeFactors(dds)
+dds
+```
+
+```{r}
+vst.cts <- vst(dds,
+               blind = FALSE,
+               nsub = 1000, 
+               fitType = "parametric")
+
+dim(vst.cts)
+head(vst.cts[,1:5])
+# assay(vst.cts)[1:5,1:5]
+```
+
+```{r}
+colData(vst.cts)[1:5,"sizeFactor"]
+colData(dds)[1:5,"sizeFactor"]
+```
+
+```{r}
+cds_vst <- new_cell_data_set(assay(vst.cts), 
+                         cell_metadata=mdat.subset,
+                         gene_metadata=anno)
+dim(cds_vst)
+```
+
+
+
+#Monocle Preprocess
+
+#PCA Preprocess
+
+```{r fig.height=5, fig.width=8}
+#libsize and log transformed
+#For LSI (latent semantic indexing), it converts the (sparse) expression matrix into tf-idf matrix and then performs SVD to decompose 
+set.seed(2020)
+m1 <- "LSI"
+cds <- preprocess_cds(cds, 
+                      alignment_group="Batch",
+                      scaling=TRUE,
+                      method=m1,
+                      norm_method="log", 
+                      use_genes = NULL,
+                      num_dim = 150,
+                      pseudo_count=1,
+                      verbose=TRUE)
+
+# plot_pc_variance_explained(cds)
+```
+
+```{r}
+cds@preprocess_aux
+cds@reduce_dim_aux
+cds@reducedDims #list data for reduceDims has LSI (TFIDF) and PCA
+# head(cds@assays$data$counts[,1:5]) 
+# dim(cds@assays$data$counts[,1:5]) #original data
+
+#How do I get the actaul TDIDF matrix - 
+```
+
+```{r fig.height=4, fig.width=4}
+cds <- reduce_dimension(cds, 
+                        preprocess_method=m1,
+                        max_components = 3,
+                        reduction_method = "UMAP", 
+                        umap.metric="cosine", 
+                        umap.min_dist= 0.001, #0.0001
+                        umap.n_neighbors=3,
+                        umap.fast_sgd=FALSE,
+                        umap.nn_method="annoy",
+                        n_trees=100,
+                        search_k=7500,
+                        cores=4,
+                        verbose=TRUE)
+
+cds <- reduce_dimension(cds,
+                        preprocess_method=m1,
+                        max_components=3, 
+                        reduction_method = "tSNE")
+
+```
+
+```{r}
+plot_cells(cds, color_cells_by = "Group",
+           reduction_method = "UMAP")
+plot_cells(cds, color_cells_by = "Group", 
+           reduction_method = "tSNE")
+```
+
+```{r}
+plot_cells(cds, color_cells_by = "AML_Subtype",
+           reduction_method = "UMAP")
+```
+
+
+#VST Transformed
+
+```{r fig.height=5, fig.width=8}
+#libsize and log transformed
+#For LSI (latent semantic indexing), it converts the (sparse) expression matrix into tf-idf matrix and then performs SVD to decompose 
+set.seed(2020)
+cds_vst <- preprocess_cds(cds_vst, 
+                      alignment_group="Batch",
+                      scaling=TRUE,
+                      method="LSI",
+                      norm_method="none", 
+                      use_genes = NULL,
+                      num_dim = 150,
+                      pseudo_count=1,
+                      verbose=TRUE)
+
+plot_pc_variance_explained(cds_vst)
+```
+
+```{r fig.height=4, fig.width=4}
+# Found 4 connected components, falling back to 'spca' initialization with init_sdev = 1??
+cds_vst <- reduce_dimension(cds_vst, 
+                        preprocess_method="LSI",
+                        max_components = 3,
+                        reduction_method = "UMAP", 
+                        umap.metric="cosine", 
+                        umap.min_dist= 0.001, 
+                        umap.n_neighbors=3,
+                        umap.fast_sgd=FALSE,
+                        umap.nn_method="annoy",
+                        n_trees=100,
+                        search_k=7500,
+                        cores=4,
+                        verbose=TRUE)
+
+plot_cells(cds_vst, color_cells_by = "Group")
+```
+
+
+```{r fig.height=5, fig.width=5}
+plot_cells(cds_vst, color_cells_by = "AML_Subtype")
+```
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

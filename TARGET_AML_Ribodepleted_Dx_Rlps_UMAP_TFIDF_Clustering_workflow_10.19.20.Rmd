@@ -1,0 +1,641 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq"
+author: "Scott Furlan, modified by Jenny Smith"
+date: "10/19/20"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+```
+
+```{r message=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(RColorBrewer)
+
+
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(DeGSEA)
+
+getwd()
+```
+
+
+#Read in the Clinical Data
+
+```{r message=FALSE, warning=FALSE}
+merged <- readr::read_csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_9.18.20.csv"))
+
+merged <- merged %>%
+  filter(USI != "Unknown", !is.na(USI))
+
+dim(merged) #2314  145
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,"SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_10.08.20.csv"),
+                        row.names = 1) %>%
+  mutate_at(vars(Group,AML_Subtype,Time_point,Tissue,Protocol), ~gsub("CD34_NBM","CD34_PB",.))
+  
+dim(sample_info)
+```
+
+
+#Read in Counts Data
+
+```{r}
+rbd_counts <- readRDS(file.path(PROJHOME,"0000.00.03_ExpressionMatrices/TARGET_AML_MPN_DS_NBM_")) %>% 
+  column_to_rownames("Gene")
+
+
+dim(rbd_counts) #51573  2418
+head(rbd_counts[,1:5])
+```
+
+
+# Select input samples and Filter Low read counts
+
+```{r}
+# include_samples <- read.csv("TARGET_AML_dx_rlps_NBM_sample_info.csv",
+#                             row.names = 1)
+
+include_samples <- sample_info %>% 
+  filter(grepl("diagnostic|relapse|NBM|CD34_PB", Time_point)) %>%
+  filter(!grepl("MPN|DS|TMD|Flow", Group)) %>% 
+  filter(Sample %in% colnames(rbd_counts)) %>%
+  mutate(Subtype_Time_point=ifelse(Group == "AML",
+                                   paste(AML_Subtype, Time_point, sep=": "),
+                                   AML_Subtype)) %>%
+  left_join(., select(merged,-one_of(c("Protocol","Primary.CNV","Additional.Fusions.CNV",
+                                       "Primary.Fusion","Group","Reg."))),
+            by="USI") %>% 
+  filter(!grepl("AML|No.Primary.Fusion|RBM15-MKL1", AML_Subtype)) %>% 
+  
+  as.data.frame() %>%
+  set_rownames(.$Sample)
+
+
+
+head(include_samples)
+dim(include_samples) #Stella not in the RBD counts?
+
+
+
+table(include_samples$Subtype_Time_point) %>%  length()
+# table(include_samples$Time_point)
+table(include_samples$AML_Subtype)
+# write.csv(include_samples,"TARGET_AML_dx_rlps_NBM_sample_info.csv")
+# getwd()
+```
+
+
+```{r}
+keep <- rowSums(rbd_counts >= 10) >= min(table(include_samples$AML_Subtype)) #minimun number of samples in AML_Subtype
+in_counts <- as.matrix(rbd_counts[keep, include_samples$Sample]) 
+
+dim(in_counts) # 30507  1316
+head(in_counts[,1:5])
+
+# write.csv(in_counts,"TARGET_AML_dx_rlps_NBM_fractional_counts.csv")
+```
+
+
+#Colors for Plotting
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+# barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+```{r}
+# cc <- readRDS("UMAP_dx_rlps_ColorCodes_10.19.20.RDS") #~/tmp/UMAP/
+```
+
+```{r fig.height=5, fig.width=10}
+group.order <- unique(include_samples$Subtype_Time_point)
+group.order <- group.order[order(group.order)]
+group.order <- group.order[-grep("^NBM$|^CD34_PB$",group.order)]
+group.order <- c("NBM","CD34_PB", group.order)
+
+
+paired <- c(brewer.pal(12,"Paired")[-12],"khaki4")
+# paired[c(7:8)] <- c("pink","deeppink")
+group.colors <- c(viridis_pal(option="E",end=0.5)(2),
+                  paired,
+                  viridis_pal(option="B", begin=0.4,end=0.6,
+                              direction = -1)(2),
+                  viridis_pal(option="D", begin=0.2,end=0.5,
+                              direction = -1)(2))
+
+
+par(mar=c(14,4,4,2))
+barplot(rep(1,length(group.order)), col=group.colors, names.arg = group.order, las=2)
+```
+
+```{r fig.height=4}
+subtype.levels <- c("AML", 
+                    "CBFA2T3-GLIS2",
+                    "CBFB-MYH11", 
+                    "DEK-NUP214",
+                    "KMT2A",
+                    "ETS-Fusion",
+                    "No.Primary.Fusion",
+                    "NUP98-KDM5A", 
+                    "NUP98-NSD1",
+                    "RBM15-MKL1",
+                    "RUNX1-RUNX1T1",
+                    "NBM",
+                    "CD34_PB")
+
+Cols <- c("Group","Time_point", "Tissue", "Protocol", "AML_Subtype","Subtype_Time_point", "Batch")
+df <- include_samples %>% 
+  select(all_of(Cols)) %>%
+  mutate(AML_Subtype=factor(AML_Subtype, levels=subtype.levels))
+
+#make color codes
+cc <- colorCodes_aheatmap(df=df)
+cc <- lapply(cc, function(x){x[["AML"]] <- "azure2"; return(x)})
+cc <- lapply(cc, function(x){x[["NBM"]] <- "black"; return(x)})
+cc <- lapply(cc, function(x){x[["CD34_PB"]] <- "grey50"; return(x)})
+cc$Subtype_Time_point <- set_names(group.colors[1:length(group.order)], group.order)
+cc$Subtype_Time_point[["DEK-NUP214: diagnostic"]] <- "pink"
+cc$Subtype_Time_point[["DEK-NUP214: relapse"]] <- "deeppink"
+
+
+par(mar=c(14,4,4,2))
+barplot(rep(1,length(cc$AML_Subtype)), col=cc$AML_Subtype, names.arg=names(cc$AML_Subtype),las=2)
+barplot(rep(1,length(cc$Subtype_Time_point)), col=cc$Subtype_Time_point, names.arg=names(cc$Subtype_Time_point),las=2)
+
+# saveRDS(cc,"UMAP_dx_rlps_ColorCodes_10.19.20.RDS")
+```
+
+
+# UMAP Projection 
+
+```{r}
+sample_total <- apply(in_counts, 2, sum)
+geomean <- exp(mean(log(sample_total)))
+sf <- sample_total/geomean
+sf.scaled <- t(t(in_counts)/sf)
+```
+
+
+## TF-IDF 
+
+```{r}
+
+# TFIDF <-  seqGlue::tf_idf_transform(sf.scaled)
+TFIDF <- readr::read_csv("TARGET_AML_dx_rlps_NBM_TFIDF.csv") #~/tmp/UMAP/
+TFIDF <- as.data.frame(TFIDF) %>%
+  column_to_rownames("X1")
+TFIDF <- as.matrix(TFIDF)
+
+head(TFIDF[,1:5])
+dim(TFIDF) #31241  2017
+range(TFIDF) #-0.9856885  0.9822756
+
+# write.csv(as.matrix(TFIDF),"TARGET_AML_dx_rlps_NBM_TFIDF.csv")
+```
+
+## Input Feature selection 
+
+```{r eval=FALSE}
+library(jackstraw)
+  #Plus PCA (Jackstraw) Feature Selection 
+  PA = permutationPA(as.matrix(TFIDF), 
+                     B = 100, #100 iterations
+                     threshold = 0.05, 
+                     seed=2020)
+  suppressMessages(gc())
+  
+  pa.plot <- plot(PA$p,  pch = 20, 
+                  main = "Permutation Parallel Analysis P-values",
+                  ylab = "P-values", xlab = "Principal Component")
+  
+  #select number of pricinipal components that encompass most variance explained
+  N_comp <- PA$r
+  if(N_comp < 3){
+    message(paste("permutationPA found", N_comp ,"significant principal components."))
+    N_comp <- 50
+  }
+  print(paste("Using",N_comp,"principal components"))
+  
+  #Jackstraw PCA to determine genes sign. associated with the selected number of PCs
+  out <-  jackstraw_pca(dat=as.matrix(TFIDF), 
+                        r=N_comp,
+                        s=100, B=100,
+                        verbose = TRUE, 
+                        seed=2020) 
+  suppressMessages(gc())
+  
+  #Select genes significantly assoc. with principal components
+  input_features <- rownames(TFIDF)[out$p.value < 0.05]
+  
+  #results 
+  res <- list("input_features"=input_features, "N_comp"=N_comp)
+  
+# saveRDS(res, "TARGET_AML_jackstraw_pca_PC2.RDS")
+length(input_features)
+# head(out$p.value[out$p.value < 0.05])
+```
+
+```{r}
+res <- readRDS("TARGET_AML_jackstraw_pca_PC2.RDS")
+input_features <- intersect(res$input_features, rownames(in_counts))
+length(input_features)
+```
+
+```{r}
+library(DelayedArray)
+# Mean vs Dispersion Feature Selection 
+disp_trend_obj <- seqGlue::calc_dispersion(in_counts[input_features,], 
+                                  removeOutliers = TRUE) #removes outlier 
+
+input_genes <- seqGlue::get_selected_genes(seqGlue::select_genes(disp_trend_obj, top_n=NULL))
+length(input_genes) 
+
+# saveRDS(input_genes,"TARGET_AML_jackstraw_pca_PC2_disp_trend_input_features.RDS")
+```
+
+```{r}
+input_genes <- readRDS("TARGET_AML_jackstraw_pca_PC2_disp_trend_input_features.RDS") #~/tmp/UMAP/
+head(input_genes)
+length(input_genes)
+```
+
+## Run the workflow
+
+```{r}
+#columns to use for plotting
+Cols <- c("Group","Time_point", "Tissue", "Protocol", "AML_Subtype","Subtype_Time_point", "Batch")
+
+#n_neighbors:  Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+# min_dist: Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points.
+
+dx_rlps_umap <- UMAP_workflow(TFIDF_Matrix = TFIDF,
+                              input_features = input_genes,
+                              samples_vector = pull(include_samples,Sample), 
+                              sample_info_df = include_samples, 
+                              cc=cc, 
+                              min_dist = 0.15,
+                              n_neighbors=40,
+                              k2=10,res2=0.001,
+                              scale_data=FALSE,
+                              Columns_for_Plots = Cols,
+                              addl_color_vector = colors37)
+```
+
+The `add` argument of `group_by()` is deprecated as of dplyr 1.0.0.
+Please use the `.add` argument instead.
+
+Error: `nrow` * `ncol` needs to be larger than the number of break
+```{r}
+dx_rlps_umap <- readRDS("dx_rlps_umap_mindist0.15_nneighbors40.RDS")
+length(dx_rlps_umap$input_features)
+# saveRDS(dx_rlps_umap, "dx_rlps_umap_mindist0.15_nneighbors40.RDS")
+
+# saveRDS(dx_rlps_umap, "dx_rlps_umap_mindist0.15_nneighbors30.RDS")
+# saveRDS(dx_rlps_umap, "dx_rlps_umap_mindis0.05_nneighbors15.RDS")
+```
+
+```{r fig.height=10, fig.width=10}
+# dx_rlps_umap$umap_2D_scatter
+```
+
+```{r}
+# dx_rlps_umap$cluster_plots1
+# dx_rlps_umap$cluster_plots2
+```
+
+```{r}
+# dx_rlps_umap$cluster_KM1$OS_KM
+table(dx_rlps_umap$outcome_df1$Major_vs_minor_Subtype_in_Cluster,
+      dx_rlps_umap$outcome_df1$cluster)
+```
+
+
+# Figures 
+
+```{r}
+res <- dx_rlps_umap$umap_res %>%
+  mutate_at(vars(Subtype_Time_point),~factor(.,levels=group.order)) %>% 
+  left_join(., data.frame(Colors=cc$Subtype_Time_point) %>%
+              rownames_to_column("Subtype_Time_point"),
+            by="Subtype_Time_point")
+# head(res)
+
+table(res$Subtype_Time_point)
+```
+
+```{r}
+
+```
+
+```{r}
+# install.packages("scatterplot3d") # Install
+library("scatterplot3d")
+```
+
+```{r fig.height=7}
+input <- filter(res, !grepl("CD34", Subtype_Time_point))
+scatterplot3d(input[,c("x","y","z")], pch = 16, 
+              color=alpha(pull(input,Colors), 0.7),
+              cex.axis=4.0,cex.symbols=2.0)
+```
+
+
+
+### 3D Plot.ly 
+
+```{r message=FALSE}
+library(plotly)
+```
+
+```{r}
+hover_info <- c("Sample", "Primary.Fusion","Age.in.years","EFS.event.type.ID","Time_point","Overlap.Mutation.Info")
+info_df <- select(include_samples,all_of(hover_info)) %>%
+  mutate_if(is.numeric, ~round(., digits=2))
+
+
+info <- gather(info_df,"Col","Value",-Sample) %>%
+  mutate_at(vars(Value), ~paste(Col, ": ", .)) %>%
+  spread(Col, Value) %>%
+  unite("hover_statement",sep="\n",na.rm = T)  %>%
+  pull(hover_statement)
+
+
+# head(info)
+# tail(info)
+```
+
+```{r fig.width=16}
+textcol <- rgb(0,0,0)
+bgcol <- rgb(1,1,1)
+Group_Col <- "Subtype_Time_point"
+
+p.dx.rlps <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=res,
+            x = ~x, y = ~y, z = ~z,
+            color = as.formula(paste0("~", Group_Col)),
+            colors = cc[[Group_Col]],
+            type='scatter3d',
+            mode='markers',
+            text=info,
+            hoverinfo='text',
+            showlegend=TRUE,
+            marker=list(size=4.5,
+                        opacity=0.5),
+                        # line=list(color=col2hex("grey80"),
+                        #           width=0.25)),
+            # line=list(size=1, color=col2rgb("grey80")),
+            inherit = TRUE) %>%
+  # title=list(text="Pediatric AML Clustering By Gene Expression",
+  layout(font = list(color=textcol,
+                                size=10),
+         scene = list(xaxis = list(title = 'UMAP_1',
+                                   color=textcol,
+                                   size=10,
+                                   backgroundcolor=bgcol,
+                                   showbackground=TRUE,
+                                   showgrid=TRUE,
+                                   gridcolor=textcol,
+                                   tickcolor=textcol),
+                     yaxis = list(title = 'UMAP_2',
+                                  color=textcol,
+                                  size=18,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol),
+                     zaxis = list(title = 'UMAP_3',
+                                  color=textcol,
+                                  size=10,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol),
+                     bgcolor=bgcol,
+         legend=list(font=list(size=12, color=textcol),
+                     itemsizing="constant"),
+         plot_bgcolor=bgcol,
+         paper_bgcolor=bgcol))
+ 
+p.dx.rlps
+
+# saveRDS(p.dx.rlps, "TARGET_AML_dx_rlps_NBM_plotly_object.RDS")
+```
+
+```{r}
+# install.packages("processx")
+# orca(p.dx.rlps,"dx_rlps_3dscatter.pdf", format = "pdf")
+```
+
+```{r}
+htmlwidgets::saveWidget(as_widget(p.dx.rlps),
+                        "TARGET_AMLdx_rlps_NBM_PCAselect_not_selfcontained.html",
+                        selfcontained = FALSE,
+                        background = bgcol,
+                        knitrOptions = list(dpi=1200, 
+                                            fig.height = 15,
+                                            fig.width=15,
+                                            out.width=15, 
+                                            out.height=15))
+```
+
+
+
+### 3D Static
+ 
+```{r}
+# devtools::install_github("AckerDWM/gg3D")
+library(gg3D)
+library(cowplot)
+# library(svglite) #svglite
+```
+
+```{r fig.height=7, fig.width=10}
+# NOTE: Cannot do the standard 'hacky' way of subsetting your ggplot data and adding the group of interest a second layer, such as to make the points bigger or add stroke etc. 
+# 
+# Instead, use the whole dataset as input for a second layer for a group of interest. Change all unwanted color/fill values to NA. Then set the scale_XXX_disrete/scale_XXXX_manual with na.value=NA and/or with na.translate=FALSE to be transparent. Othersize the axes/rotation do not match up because a new min/max for x,y,z coors are used to draw the axes. 
+
+input <- filter(res, !grepl("CD34",Subtype_Time_point)) %>%
+  droplevels()
+
+theta=-120
+phi=15
+
+#good anlges
+#t=90,phi=10
+#t=-110,phi=-20
+
+
+bgCol <- "white"
+txtCol <- "black"
+
+p <- ggplot(data=input, 
+            mapping=aes(x=x, y=y,z=z, 
+                        color=Subtype_Time_point,
+                        fill=Subtype_Time_point)) +
+    axes_3D(theta=theta, phi=phi, color=txtCol) +
+    stat_3D(geom = "point", 
+          theta=theta,
+          phi=phi,
+          shape=21,
+          size=2.5,
+          # color="grey50",
+          stroke=0.2,
+          alpha=0.8)  +
+  theme_void() +
+  # guides(color=guide_legend(override.aes = list(size=4,alpha=1)), fill='none') +
+  scale_color_manual(values=cc$Subtype_Time_point[-2], 
+                     # labels=labs,
+                     na.value=NA,
+                     na.translate = FALSE) +
+  scale_fill_manual(values=cc$Subtype_Time_point[-2],
+                    # labels=labs,
+                    na.value=NA,
+                     na.translate = FALSE) +
+  theme(legend.text = element_text(size=14),
+        legend.title = element_blank()) 
+  # labs_3D(labs=c("UMAP_1", "UMAP_2", "UMAP_3"),
+  #   hjust=c(0,0,0),
+  #   vjust=c(10,0,0),
+  #   angle=c(0,0,0),
+  #   size=6,
+  #   color=txtCol)
+
+p
+
+
+# saveRDS(p,"TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_3Dscatter.RDS")
+```
+
+
+```{r}
+p <- readRDS("TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_3Dscatter.RDS")
+```
+
+
+```{r}
+output="svg"
+fname <- paste0("TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_3Dscatter.",
+                output)
+
+ggsave(filename = fname,
+       plot=p,
+       height = 7, width=10,
+       units="in",
+       dpi=300,
+       device=output)
+
+```
+
+
+### 2D Scatter plots
+
+```{r fig.height=7, fig.width=10}
+input <- filter(res,!grepl("CD34", Subtype_Time_point)) #
+
+dim12 <- ggplot() +
+      geom_point(data= filter(input,grepl("diagnostic|NBM", Subtype_Time_point)),
+                 mapping= aes(x=x,y=y,color=Subtype_Time_point),
+                 size=2.0, alpha=0.75, shape=19) +
+      geom_point(data=filter(input,grepl("relapse", Subtype_Time_point)),
+                  mapping=aes(x=x,y=y,color=Subtype_Time_point),
+                 size=2.5, alpha=0.75, shape=19) +
+      scale_color_manual(values=cc$Subtype_Time_point) +
+      xlab("UMAP_1") + ylab("UMAP_2") +
+      labs(title="") +
+      theme_classic() +
+      guides(color=guide_legend(override.aes = list(size=4, alpha=1)), fill='none') +
+      theme(plot.margin = margin(r = 5, unit="mm"),
+            axis.text = element_text(size=14),
+            legend.text = element_text(size=14),
+            legend.title = element_blank())
+      
+
+# pdf("TARGET_AML_sg6816_UMAP_dim1_2Dscatter.pdf", height = 7, width=10)
+dim12
+# dev.off()
+# saveRDS(dim12,"TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_dim1_2Dscatter.RDS")
+```
+
+```{r}
+dim12 <- readRDS("TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_dim1_2Dscatter.RDS")
+```
+
+
+```{r}
+output="svg"
+fname <- paste0("TARGET_AML_dx_rlps_NBM_umap_mindist0.15_nneighbors40_dim1_2Dscatter.",
+                output)
+
+ggsave(filename = fname,
+       plot=dim12,
+       height = 7, width=10,
+       units="in",
+       dpi=300,
+       device=output)
+
+```
+
+
+```{r fig.height=7, fig.width=10}
+dim13 <- ggplot() +
+      geom_point(data= filter(input,grepl("diagnostic|NBM", Subtype_Time_point)),
+                 mapping= aes(x=x,y=z,color=Subtype_Time_point),
+                 size=2.0, alpha=0.75, shape=19) +
+      geom_point(data=filter(input,grepl("relapse", Subtype_Time_point)),
+                  mapping=aes(x=x,y=z,color=Subtype_Time_point),
+                 size=2.5, alpha=0.75, shape=19) +
+      scale_color_manual(values=cc$Subtype_Time_point) +
+      xlab("UMAP_1") + ylab("UMAP_3") +
+      labs(title="") +
+      theme_classic() +
+      guides(color=guide_legend(override.aes = list(size=4, alpha=1)), fill='none') +
+      theme(plot.margin = margin(r = 5, unit="mm"),
+            axis.text = element_text(size=14),
+            legend.text = element_text(size=14),
+            legend.title = element_blank())
+
+dim13
+# saveRDS(arrangeGrob(grobs=list(cebpa_dim12,cebpa_dim13),
+#              ncol=2, widths=c(1,1.45)), "TARGET_AML_sg6816_CEBPA_UMAP_dim123_2Dscatter.RDS")
+
+```
+
+
+
+
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

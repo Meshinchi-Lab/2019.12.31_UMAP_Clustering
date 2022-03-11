@@ -1,0 +1,388 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq: Plotly Plots"
+author: "Scott Furlan, modified by Jenny Smith"
+date: "1/31/20"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+```
+
+```{r message=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(data.table)
+library(readr)
+library(tools)
+
+
+library(plotly)
+library(rgl)
+library(geometry)
+```
+
+
+#Read in the UMAP results 
+
+```{r}
+res <- read.csv("Dx_Ds_sg8596_KallistoGene/TARGET_AML_sg8596_Scale_batch12_kallistoGene_UMAP_CDE.csv") %>% 
+  mutate_at(vars(Mutations.Category), ~case_when(
+    is.na(.) ~ Group,
+    .=="OtherAML" ~ "AML",
+    TRUE ~ .)) %>% 
+  set_rownames(.$Colname)
+
+head(res[,1:10])
+dim(res) 
+```
+
+```{r}
+table(res$Mutations.Category, useNA = 'ifany')
+```
+
+```{r}
+cc <- readRDS("UMAP_ColorCodes_2.18.20.RDS")
+```
+
+```{r}
+clusterColors <- readRDS("ClusterColors.RDS")
+```
+
+# Schema/ Settings for Plotly
+
+```{r}
+s <- schema(jsonedit = FALSE)
+threeDim <- s$traces$scatter3d
+params_to_set <- names(threeDim$attributes) #these can all be edited with specific layout settings, like marker=list(col="red")
+head(params_to_set)  
+  
+names(threeDim$attributes$marker) #these are the different parameters for markers (points) and their descriptions
+mesh3d <- s$traces$mesh3d$attributes
+# s$traces$mesh3d$attributes$facecolor
+```
+
+```{r}
+coords <- list()
+clusters <- length(unique(res$cluster_k23))
+clusterColors <- clusterColors[1:clusters] %>% 
+  set_names(1:clusters)
+
+
+for (i in 1:clusters){
+  temp <- res[res$cluster_k23==i,] 
+  ch <- convhulln(as.matrix(temp[,c("x","y","z")]),
+                  options = "QJ")
+  x <- temp$x[ch[,1]]
+  y <- temp$y[ch[,2]]
+  z <- temp$z[ch[,3]]
+
+  coords[[i]] <- list(x=x,y=y,z=z)
+  rm(temp, ch,x,y,z)
+}
+names(coords) <- paste0("cluster_",1:clusters)
+```
+
+
+temp <- as.matrix(res[res$cluster2==1,c("x","y","z")])
+
+t <- distmeshnd(fd, fh, h=0.2, bo)
+
+fd = function(p, ...) sqrt((p^2)%*%c(1,1,1)) - 1
+     # also predefined as `mesh.dsphere'
+fh = function(p,...)  rep(1,nrow(p))
+     # also predefined as `mesh.hunif'
+bbox = matrix(c(-1,1),2,3)
+p = distmeshnd(fd,fh,0.2,bbox, maxiter=100)
+
+
+
+##Example 
+
+```{r}
+#for forum help
+set.seed(1)
+example_samps <- sample(res$Colname, size=25, replace = F)
+
+df <- res[example_samps,] %>% 
+  select(x,y,z,Sample) %>% 
+  mutate(Sample=paste0("Sample_",1:25),
+         Group=sample(c("A","B","C"), size=25, replace = T))
+
+# dput(df)
+# dput(coords$cluster_1)
+```
+
+
+```{r fig.width=16}
+# plotly v4.9.0
+# https://plot.ly/python/alpha-shapes/#plotly-mesh3d
+# https://stackoverflow.com/questions/50412858/plotting-ellipse3d-in-r-plotly-with-surface-ellipse
+updatemenus <- list(
+  list(
+    active = -1,
+    type= 'buttons',
+    buttons = list(
+      list(
+        label = "Ellipsoid",
+        method = "update",
+        args = list(list(visible = c(TRUE, TRUE)))),
+      list(
+        label = "No Ellipsoid",
+        method = "update",
+        args = list(list(visible = c(TRUE, FALSE)))))
+  )
+)
+example_p <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=df,
+            x = ~x, y = ~y, z = ~z,
+            color = ~Group,
+            type='scatter3d',
+            mode='markers',
+            showlegend=TRUE,
+            marker=list(size=2.5),
+            text=df$Group,
+            hoverinfo='text',
+            inherit = TRUE) %>%
+
+    #Add 3D mesh (convex hulls)  
+    add_trace(x=coords$cluster_1$x,
+               y=coords$cluster_1$y,
+               z=coords$cluster_1$z,
+             type="mesh3d",
+             alphahull=0, #*>0*, the alpha-shape algorithm is used, If *0*,  the convex-hull algorithm is used
+             opacity=0.25,
+             showlegend=TRUE,
+             hoverinfo=list(extras="none",
+                            flags="text"),
+             inherit = FALSE) %>% #try TRUE
+   layout(title=list(text="Example Mesh3D and Scatter3D",
+                    font = list(color=rgb(1,1,1),
+                                size=18)),
+                 updatemenus=updatemenus)
+
+example_p
+```
+
+
+##Base 3D Scatter
+
+```{r}
+info <- paste(res$Sample, 
+              paste0("Mutation Category: ",res$Mutations.Category),
+              paste0("Cluster: ", res$cluster_k23),
+              sep="\n") %>% 
+  ifelse(!is.na(res$Primary.Fusion.CNV), 
+         paste(., paste0("Primary Fusion CNV: ",res$Primary.Fusion.CNV), sep="\n"), .) %>% 
+  ifelse(!is.na(res$Overlap.Mutation.Info),
+         paste(., gsub("/", "\n", res$Overlap.Mutation.Info), sep="\n"), .) %>%
+  gsub("OtherAML","", .) %>%
+  ifelse(!is.na(res$Age.in.years),
+         paste( ., paste("Age:", round(res$Age.in.years,digits = 1),"yrs"), sep="\n"), .) %>%
+  ifelse(!is.na(res$EFS.event.type.ID),
+         paste(., res$EFS.event.type.ID, sep="\n"), .)  %>%
+  gsub("Unknown","",.) %>% 
+  set_names(., res$Sample)
+                         
+# sample(info,size = 20)
+head(info)
+```
+
+```{r fig.width=16}
+p.fusions <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=res,
+            x = ~x, y = ~y, z = ~z,
+            color = ~AML_Subtype,
+            colors = cc$AML_Subtype,
+            type='scatter3d',
+            mode='markers',
+            showlegend=TRUE,
+            marker=list(size=1.5),
+            text=info,
+            hoverinfo='text',
+            inherit = TRUE) %>%
+  layout(title=list(text="Kallisto Quant Clustering By Gene Expression",
+                    font = list(color=rgb(1,1,1),
+                                size=18)),
+         scene = list(xaxis = list(title = 'UMAP_1',
+                                   color=rgb(1,1,1),
+                                   size=18,
+                                   backgroundcolor=rgb(0,0,0),
+                                   showbackground=TRUE,
+                                   showgrid=TRUE,
+                                   gridcolor=rgb(1,1,1),
+                                   tickcolor=rgb(1,1,1)),
+                     yaxis = list(title = 'UMAP_2',
+                                  color=rgb(1,1,1),
+                                  size=18,
+                                  backgroundcolor=rgb(0,0,0),
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                   gridcolor=rgb(1,1,1)),
+                     zaxis = list(title = 'UMAP_3',
+                                  color=rgb(1,1,1),
+                                  size=18,
+                                  backgroundcolor=rgb(0,0,0),
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=rgb(1,1,1)),
+                     bgcolor=rgb(0,0,0)),
+         showlegend=TRUE,
+         legend=list(font=list(size=18, color=rgb(1,1,1)),
+                     tracegroupgap=5),
+          plot_bgcolor=rgb(0,0,0),
+         paper_bgcolor=rgb(0,0,0))
+ 
+p.fusions
+```
+
+
+```{r fig.width=16}
+p.mutations <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=res,
+            x = ~x, y = ~y, z = ~z,
+            color = ~Mutations.Category,
+            colors = cc$Mutations.Category,
+            type='scatter3d',
+            mode='markers',
+            showlegend=TRUE,
+            marker=list(size=1.5),
+            text=info,
+            hoverinfo='text',
+            inherit = TRUE) %>%
+  layout(title=list(text="Kallisto Quant Clustering By Gene Expression by Mutation",
+                    font = list(color=rgb(1,1,1),
+                                size=18)),
+         scene = list(xaxis = list(title = 'UMAP_1',
+                                   color=rgb(1,1,1),
+                                   size=18,
+                                   backgroundcolor=rgb(0,0,0),
+                                   showbackground=TRUE,
+                                   showgrid=TRUE,
+                                   gridcolor=rgb(1,1,1),
+                                   tickcolor=rgb(1,1,1)),
+                     yaxis = list(title = 'UMAP_2',
+                                  color=rgb(1,1,1),
+                                  size=18,
+                                  backgroundcolor=rgb(0,0,0),
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                   gridcolor=rgb(1,1,1)),
+                     zaxis = list(title = 'UMAP_3',
+                                  color=rgb(1,1,1),
+                                  size=18,
+                                  backgroundcolor=rgb(0,0,0),
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=rgb(1,1,1)),
+                     bgcolor=rgb(0,0,0)),
+         showlegend=TRUE,
+         legend=list(font=list(size=18, color=rgb(1,1,1)),
+                     tracegroupgap=5),
+          plot_bgcolor=rgb(0,0,0),
+         paper_bgcolor=rgb(0,0,0))
+ 
+p.mutations
+```
+
+
+```{r}
+final <- subplot(p.fusions, p.mutations)
+```
+
+```{r}
+# htmlwidgets::saveWidget(as_widget(p.fusions),"scaledInput_ColorbyFusions_UMAP.html", background = "black")
+# htmlwidgets::saveWidget(as_widget(p.mutations),"scaledInput_ColorbyMutations_UMAP.html", background = "black")
+```
+
+
+###Convex Hull
+
+```{r}
+# Cannot yet figure out the appropriate way to get the hovertext to show only the points, not the convex hulls.
+
+# updatemenus <- list(
+#   list(
+#     active = -1,
+#     type= 'buttons',
+#     buttons = list(
+#       list(
+#         label = "Ellipsoid",
+#         method = "update",
+#         args = list(list(visible = c(TRUE, TRUE)))),
+#       list(
+#         label = "No Ellipsoid",
+#         method = "update",
+#         args = list(list(visible = c(TRUE, FALSE)))))
+#   )
+# )
+
+p2 <- p.fusions
+for(i in 1:length(coords)){
+  p2 <- p2 %>%
+     add_trace(x=coords[[i]]$x,
+               y=coords[[i]]$y,
+               z=coords[[i]]$z,
+             type="mesh3d",
+             alphahull=0, #*>0*, the alpha-shape algorithm is used, If *0*,  the convex-hull algorithm is used
+             opacity=0.25,
+             colors=clusterColors[i],
+             showlegend=TRUE,
+             hoverinfo=list(extras="none",
+                            flags="text"),
+             inherit = FALSE) 
+
+}
+
+
+p2
+```
+
+```{r}
+htmlwidgets::saveWidget(as_widget(p2),"", background = "black")
+```
+
+
+
+#TSNE Plot
+
+```{r}
+# tsne<-fftRtsne(X=t(vdata), pca_scale = FALSE, max_iter = 1000,  nthreads=detectCores())
+# 
+# toplot<-data.frame(x=tsne[,1],y=tsne[,2])
+# toplot<-as.data.frame(cbind(toplot, fixed_meta))
+
+
+ggplot(toplot, aes(x=x,y=y,col=Primary_Fusion))+
+  geom_point( size=4)+
+  xlab("UMAP_1") + ylab("UMAP_2")+scale_color_manual(values=cls) -> g1
+m3addon::red_dim_plot(g1)
+```
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,426 @@
+---
+title: "UMAP Clustering of CREBBP Ribodepleted RNA-seq"
+author: "Jenny Smith"
+date: "10/05/21"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(RColorBrewer)
+
+
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+
+library(REDCapR)
+library(DeGSEA)
+
+getwd()
+```
+
+
+# Raw Counts
+
+```{r}
+genome <- "GRCh37"
+```
+
+
+## GRCh37 
+
+```{r}
+if(genome=="GRCh37"){
+  grch37_files <- dir(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/BCCA_GRCh37_Ensembl_v69"),
+                      full.names=TRUE)
+  # grch37_files
+  
+  ##Counts 
+  grch37_cts_file <- grep("dupGenesRemoved_FractionalCounts", grch37_files,value=T)
+  message("Reading the counts file.")
+  cts_grch37 <- readRDS(file.path(grch37_cts_file))
+  colnames(cts_grch37)[grep("PATGIG|PATISD", colnames(cts_grch37))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(cts_grch37), value=TRUE))
+
+  gene_ids <- cts_grch37[,c(1:2)]
+  cts_grch37 <- as.data.frame(cts_grch37)
+  rownames(cts_grch37) <- cts_grch37$geneSymbol
+  cts_grch37 <- cts_grch37[,-c(1:2)]
+
+  
+  ##TPM
+  grch37_TPM_file <- grep("dupGenesRemoved_TPM", grch37_files, value = T)
+  message("Reading in the TPM file.")
+  TPM_grch37 <- readRDS(file.path(grch37_TPM_file))
+  colnames(TPM_grch37)[grep("PATGIG|PATISD", colnames(TPM_grch37))] <- gsub("_replicate", "", grep("PATGIG|PATISD", colnames(TPM_grch37), value=TRUE))
+
+  gene_ids <- TPM_grch37[,c(1:2)]
+  TPM_grch37 <- as.data.frame(TPM_grch37)
+  rownames(TPM_grch37) <- TPM_grch37$geneSymbol
+  TPM_grch37 <- TPM_grch37[,-c(1:2)]
+
+  
+  ## 0531 TPM 
+  # polyA_files <-  dir(grch37_files[grep("PolyA", grch37_files)], full.names = TRUE)
+  # TPM_0531_grch37 <- read.csv(file.path(grep("AAML0531_dupGenesRemoved_TPM", polyA_files, value=T)))
+}
+```
+
+
+# ClinData
+
+```{r message=FALSE}
+#https://cran.r-project.org/web/packages/REDCapR/vignettes/workflow-read.html 
+project <- "CREBBP_Fusion_vs_Mutation_Clustering"
+
+if(project==""){
+  stop("Must include Projecy name!")
+}else{
+  message(paste0("Project is: ",project))
+  current_cde_database <- paste("TARGET_AML_CDEs_For_Project",project, ".RDS", sep="_")
+  
+  if(file.exists(current_cde_database)){
+    merged <- readRDS(current_cde_database)
+      
+  }else{
+    path_credential <- file.path(HOME,".redcap")
+    project_id <- 1295
+  
+    credential  <- REDCapR::retrieve_credential_local(
+      path_credential = path_credential,
+      project_id = project_id)
+    
+    #takes about 30 sec to download. 
+    merged <- redcap_read(redcap_uri = credential$redcap_uri, 
+                          token = credential$token, 
+                          raw_or_label_headers = 'label')
+    if(merged$success){
+      merged <- data.frame(merged$data, check.names=TRUE) #remove the white spaces  (will this even work??)
+      saveRDS(merged, current_cde_database)
+    }
+    
+    #Create a simple log file from the day the project starts
+    cat(c(paste("Date:", Sys.Date()),
+          paste("cts:", basename(get(ls(pattern = "_cts_file")))),
+          paste("tpm:", basename(get(ls(pattern = "_TPM_file")))), 
+          paste("CDE:", current_cde_database)),
+          sep = "\n", 
+          file = paste(project, Sys.Date(), ".log", sep="_"))
+  }
+  
+  #keep a list of the ineligable patiens to remove if necessary
+  inelig <- merged %>% 
+    filter(Eligibility.Comments == "remove") %>% 
+    pull(USI)
+  
+  #Filter those with USIs and are eligible for the study
+  merged <- merged %>% 
+    filter(Eligibility.Comments != "remove")
+  
+  
+  dim(merged) 
+  head(merged)
+}
+```
+
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_08.12.21.csv")) 
+
+dim(sample_info)
+```
+
+ 
+```{r}
+CREBBP <- read.csv("Results/Dx_AML_CREBBP/CREBBP_list_for_UMAP.csv")
+
+head(CREBBP)
+# tail(CREBBP)
+# dim(CREBBP) #2313    2
+any(duplicated(CREBBP$USI))
+```
+
+
+
+# Select input samples 
+
+```{r}
+include_samples <- sample_info %>% 
+  # filter(!grepl("FLAGGED|FlowSorted", Time_point)) %>% 
+  # filter(!grepl("Adult AML (Stirewalt)", Group)) %>% 
+  # filter(!grepl("AZA", Sample)) %>% 
+  
+  filter(grepl("^AML$|NBM", Group), 
+         grepl("diagnostic|NBM", Time_point)) %>%
+  filter(Sample %in% colnames(cts_grch37)) %>% 
+  filter(!grepl("_replicate", Sample),
+         !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample)) %>% 
+  
+  left_join(., CREBBP, by="USI") %>% 
+  mutate_at(vars(CREBBP.alteration), ~case_when(
+    is.na(.) ~ Group,
+    .=="none" & grepl("KMT2A|CBFB-MYH11|RUNX1-RUNX1T1",AML_Subtype) ~ AML_Subtype,
+    .=="none" ~ gsub("none","OtherAML",.),
+    TRUE ~ paste0("CREBBP_", .))) %>% 
+
+  left_join(., select(merged,-one_of(c("Protocol","Primary.CNV",
+                                       "Additional.CNV.or.Fusion",
+                                       "Primary.Fusion","Group"))),
+            by="USI") %>% 
+  mutate(USI1=USI,
+         USI=Sample) %>% 
+  as.data.frame() %>%
+  set_rownames(.$Sample)
+
+
+
+# head(include_samples)
+dim(include_samples) # 1578  169
+```
+
+```{r}
+# table(include_samples$AML_Subtype)
+table(include_samples$Group)
+table(include_samples$Time_point)
+table(include_samples$CREBBP.alteration)
+```
+
+
+# Subset Counts 
+
+```{r}
+library(edgeR)
+in_cts <- cts_grch37[,include_samples$Sample]
+
+
+AML <- ! grepl("BM[0-9]|R[O0][0-9]", colnames(in_cts))
+keep <- rowSums(cpm(in_cts[,AML]) >= 1) >= 0.01*ncol(in_cts[,AML])
+cts.filtered <- in_cts[keep, ]
+
+dge <- DGEList(counts=cts.filtered)
+dge <- calcNormFactors(dge,method = "TMMwsp")
+
+logCPM <- edgeR::cpm(dge,log=TRUE,normalized.lib.sizes=TRUE, prior.count=1)
+CPM <- edgeR::cpm(dge,log=FALSE,normalized.lib.sizes=TRUE, prior.count=1)
+
+dim(logCPM) #22,974  
+head(logCPM[,1:5])
+```
+
+
+# Colors for Plotting
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+# barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+
+# UMAP Workflow from Counts
+
+# Subset Counts 
+
+```{r}
+Cols <- c("CREBBP.alteration",
+          "Batch","Tissue")
+
+all(Cols %in% colnames(include_samples)) #TRUE
+
+cc_umap <- colorCodes_aheatmap(select(include_samples, all_of(Cols)))
+cc_umap[["CREBBP.alteration"]] <- c(
+        "NBM"="black",
+        # "CD34_PB"="grey50",
+        
+        "CREBBP_frameshift"="cyan2",
+        "CREBBP_fusion"="dodgerblue",
+        "CREBBP_SNV"="darkorchid2",
+        
+        # "CBFA2T3-GLIS2"="tomato4",
+        "CBFB-MYH11"="cadetblue4",
+        "KMT2A"="khaki2",
+        "RUNX1-RUNX1T1"="burlywood3",
+        
+        "OtherAML"="grey90")
+
+par(mar=c(10,5,5,5))
+barplot(rep(1,length(cc_umap$CREBBP.alteration)),col = cc_umap$CREBBP.alteration, names.arg = names(cc_umap$CREBBP.alteration), las=2)
+```
+
+```{r}
+dds <- DESeq2::DESeqDataSetFromMatrix(round(cts.filtered, digits = 0),
+                                      colData = include_samples,
+                                      design = ~ 1)
+
+dds <- DESeq2::estimateSizeFactors(dds)
+# dds <- estimateDispersions(dds)
+dds_cts <- DESeq2::counts(dds, normalized=TRUE)
+
+vst <- DESeq2::vst(dds, blind = TRUE)
+dim(vst) #22974  1578
+```
+
+```{r}
+suppressPackageStartupMessages(library(DelayedArray))
+
+
+# Mean vs Dispersion Feature Selection 
+sel_norm_counts <-  CPM #dds_cts
+obj <- seqGlue::calc_dispersion(as.matrix(sel_norm_counts), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+
+sg_all <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+length(sg_all) 
+
+sg_top1000 <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=1000))
+
+sg_top2000 <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=2000))
+```
+
+
+## Heatmap + Dendrogram
+
+```{r}
+gene_lists <- list(sg_all, sg_top1000, sg_top2000)
+
+heatmaps <- lapply(gene_lists, function(x){
+  
+  p <- include_samples$CREBBP.alteration %>%
+  set_names(include_samples$Sample)
+
+
+  dends_res <- dge_dendrograms(expnData = in_cts,
+                  pheno = p,
+                  method = "ward.D2",
+                  percent=0.01,
+                  add.count=1,
+                  createDGE = TRUE,
+                  filterTopGenes = FALSE,
+                  genelist = x)
+
+
+  # in_vst <- SummarizedExperiment::assay(vst)[x,]
+  # 
+  # d1 <- dist(t(in_vst), method = "euclidean", diag = FALSE,
+  #            upper = FALSE) #sample distances WITHOUT SCALING
+  # d2 <- dist(in_vst, method = "euclidean", diag = FALSE,
+  #            upper = TRUE) #gene distances WITHOUT SCaling
+  # 
+  # samp.c1 <- hclust(d1, method = "ward.D2", members = NULL) #sample clustering
+  # gene.c2 <- hclust(d2, method = "ward.D2", members = NULL) #gene clustering
+  # 
+  # dends_res <- list(in_vst,samp.c1,gene.c2)
+  # names(dends_res) <- c("TMMCPM","samp.c1", "gene.c2")
+
+  #NEED TO FIX: 1) make USI or sample_ID column into a variable
+  # Provide an erorr or warning when the subset dataframe has zero rows.
+
+  anno <- DeGSEA::create_HA_Labs_Hmap(expn=dends_res$TMMCPM,
+                                      geneList = x,
+                                      cc = cc_umap[1],
+                                      CDE = include_samples,
+                                      cols = names(cc_umap[1]))
+
+
+  ComplexHmap(mat = dends_res$TMMCPM, #logCPM[DEGs.AML, heatmap.samps$Sample]
+              name = "Z-Scores",
+              scale=TRUE,
+              dge_dendrograms.res = dends_res,
+              hmap_anno_obj = anno$annoColumn)
+
+  
+  
+})
+
+# length(heatmaps)
+names(heatmaps) <- ls(pattern = "sg_")
+```
+
+
+
+
+```{r fig.height=10, fig.width=10}
+# lapply(names(heatmaps), function(x){
+#   pdf(paste0("TARGET_AML_CREBBP_", x,"_TMMCPM_Heatmap_10.6.2021.pdf"), height = 10, width = 20)
+#   print(heatmaps[[x]]) 
+#   dev.off()
+# })
+```
+
+
+
+## UMAP
+
+n_neighbors	
+The size of local neighborhood (in terms of number of neighboring sample points) used for manifold approximation. Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+min_dist	
+The effective minimum distance between embedded points. Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points. 
+
+```{r}
+suppressPackageStartupMessages(library(DelayedArray))
+
+
+# Mean vs Dispersion Feature Selection 
+sel_norm_counts <- dds_counts
+obj <- seqGlue::calc_dispersion(as.matrix(sel_norm_counts), removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+
+sg_dds <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=NULL))
+length(sg_dds) 
+
+
+
+in_vst <- SummarizedExperiment::assay(vst)[sg_dds,]
+
+dim(in_vst)
+```
+
+
+
+```{r}
+umap_bulk <- UMAP_workflow(TFIDF_Matrix = in_vst, 
+                           scale_data=FALSE,
+                           input_features = sg_dds,
+                            samples_vector = include_samples$Sample,
+                            sample_info_df = include_samples,
+                            Columns_for_Plots = Cols,
+                            cc = cc_umap, 
+                            min_dist = 0.01,
+                            n_neighbors=20,
+                            k2=15,
+                            res2=0.01)
+
+# saveRDS(umap_bulk,"TARGET_AML_CREBBP.RDS")
+```
+
+
+```{r fig.height=10, fig.width=10}
+umap_bulk$umap_2D_scatter
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+

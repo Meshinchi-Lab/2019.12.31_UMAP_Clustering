@@ -1,0 +1,1502 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq"
+author: "Scott Furlan, modified by Jenny Smith"
+date: "1/31/20"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+```
+
+```{r message=FALSE}
+library(DESeq2)
+library(seqGlue)
+# library(apeglm)
+
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(readr)
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(data.table)
+library(readr)
+library(tools)
+
+
+# library(m3addon)
+library(jackstraw)
+library(DeGSEA)
+getwd()
+```
+
+```{r}
+source(file.path(SCRIPTS,"survival_analysis/Survplot_Functions_2018.10.24.r"))
+```
+
+
+#Define Functions 
+
+###UMAP
+
+```{r}
+# NOTE:
+#  Warning does not affect anything."The message is actually coming from one iteration of the parametric dispersion fit, which also involves fitting a GLM of the dispersions over the mean. So one iteration of the fitting of the dispersion trend didn't converge, but then there is no other note, so the final iteration did converge." (https://support.bioconductor.org/p/61780/). 
+
+UMAP_function <- function(data_matrix, metadata,N,scale_data=FALSE, threads=2){
+    #data_matrix is a expression matrix, tfidf transformed with samples as columns, genes as rows. It has been subset to selected genes.
+    set.seed(2020)
+    UMAP<-uwot::umap(X = t(data_matrix), 
+                     n_components = N,
+                     scale = scale_data,
+                     metric = "cosine",
+                     spread= 1,
+                     
+                     min_dist = 0.1, #originally 0.1 by SF
+                     n_neighbors = 15L, #was default 15 
+                     fast_sgd = FALSE, 
+                     n_epochs=500, #increased from default 200
+                     
+                     init = "spectral", #default
+                     nn_method = "annoy", #Use approximate nearest neighbors 
+                     n_trees=100, #default is 50
+                     search_k=5*15*100, #default is 2*n_neighbors*n_trees
+                     repulsion_strength=1, #default
+                     
+                     n_threads=threads,
+                     tmpdir=file.path(SCRATCH,"jlsmith3"),
+                     verbose=T)
+    gc()
+    toplot<-data.frame(x=UMAP[,1],y=UMAP[,2])
+    if(ncol(UMAP)==3){toplot[["z"]] <- UMAP[,3]}
+    toplot<-as.data.frame(cbind(toplot, metadata))
+    gc()
+    
+    return(toplot)
+}
+
+```
+
+
+###Scatter Plots 2D
+
+```{r}
+scatter_plots_2d <-  function(umap_df, Columns, ColorCodes){
+    
+    ps <- list()
+    for (i in 1:length(Columns)){
+            Col <- Columns[i]
+            p <- ggplot(data=umap_df,
+                            aes_string(x="x",y="y",color=Col))+
+                      geom_point(size=1, alpha=0.75)+
+                      labs(title=paste("UMAP Colored by",Col),
+                       x="UMAP_1", y="UMAP_2") +
+                      scale_color_manual(values=ColorCodes[[Col]])  +
+                      theme_classic() +
+                      theme(axis.text = element_text(size=18),
+                            legend.position = 'top',
+                            panel.background = element_rect(fill="black",
+                                                            colour="black")) +
+                      guides(color = guide_legend(override.aes = list(size=4)))
+            ps[[i]] <- p
+    }
+  
+  
+   ag <- gridExtra::arrangeGrob(grobs=ps,col=2)
+   return(ag)
+}
+```
+
+
+
+
+### Cluster Scatter/Bar
+
+```{r}
+cluster_plots <- function(umap_results, colorCodes,colorsSubtypes){
+  scatter_plot <- ggplot(umap_results, 
+                         aes(x=x,y=y,col=as.factor(cluster))) +
+      geom_point(size=0.75)+
+      xlab("UMAP_1") + ylab("UMAP_2") +
+      labs(title="Leiden Clustering of UMAP Dimensions") +
+      theme_classic() +
+      theme(panel.background = element_rect(color = "black", fill="black")) +
+      guides(color = guide_legend(override.aes = list(size=4))) +
+      scale_color_manual(values=colorCodes)
+  
+  
+  temp <- umap_results %>% 
+    group_by(cluster, AML_Subtype) %>% 
+    summarise(N=n()) %>% 
+    ungroup() %>% 
+    group_by(cluster) %>%
+    mutate(num_in_cluster=sum(N))
+  y_lim <- max(temp$num_in_cluster)+10
+
+  cluster_members <- ggplot(temp, aes(y=N, x=as.factor(cluster), 
+                                  fill=AML_Subtype))+
+    geom_bar(stat="identity", size=0.2, width=0.75, color="black") +
+    geom_point(aes(x=as.factor(cluster), y=y_lim, color=as.factor(cluster)),
+               size=5, inherit.aes = FALSE) +
+    scale_fill_manual(values=colorsSubtypes) +
+    guides(fill=guide_legend(ncol=2)) +
+    scale_color_manual(values=colorCodes) +
+    scale_y_continuous(breaks=seq(0,y_lim,by=25),
+                       limits=c(0,y_lim)) +
+    labs(x="Cluster",y="Major Fusion Type", 
+         main="Leiden Clustering of UMAP:\nAML Subtypes in each Cluster") + 
+    theme_classic()
+  
+  
+  plots <- list("scatter"=scatter_plot,
+                "barplot"=cluster_members)
+  
+}
+```
+
+### Outcome KM
+
+```{r}
+outcome_by_cluster_df <- function(umap_results){
+  library(survival)
+  
+  outcome_df <- umap_results %>% 
+    filter(!is.na(OS.time..days.)) %>%
+    group_by(cluster) %>% 
+    mutate(N_in_cluster=n())%>%
+  
+    group_by(AML_Subtype,add = TRUE) %>% 
+    mutate(Number_Subtype_in_cluster=n()) %>%
+    ungroup() %>% 
+    
+    group_by(cluster) %>%
+    mutate(Major_Subtype_in_cluster=unique(AML_Subtype[which(Number_Subtype_in_cluster ==
+                                                               max(Number_Subtype_in_cluster))]) %>% 
+             ifelse(length(.) > 1, .[.!="No.Primary.Fusion.CNV"], .)) %>%
+    
+    mutate(Major_vs_minor_Subtype_in_Cluster=case_when(
+      AML_Subtype == Major_Subtype_in_cluster ~ paste(AML_Subtype,"Major Subtype"),
+      TRUE ~ "Minor Subtypes")) %>% 
+    ungroup() %>%
+    
+    group_by(AML_Subtype) %>%
+    mutate(Subtype_Outlier_by_cluster=case_when(
+        Number_Subtype_in_cluster < max(Number_Subtype_in_cluster) ~ "Other Clusters",
+        TRUE ~ "Majority Cluster")) %>%
+    ungroup() %>%
+    
+    # select(Sample, cluster, AML_Subtype, matches("cluster")) %>%
+    arrange(cluster,desc(Number_Subtype_in_cluster)) 
+  
+  return(outcome_df)
+}
+```
+
+```{r fig.height=7, fig.width=12}
+KM_plots_workflow <- function(outcome_data,cc_clusters){
+  library(survival)
+  
+  num_clust <- length(unique(outcome_data$cluster))
+  cluster_KM <- lapply(1:num_clust,function(x){
+    idx <- outcome_data$cluster==x
+    df <- outcome_data[idx,]
+    
+    if(nrow(df) >= 5){
+      fit_OS <- survfit(Surv(OS.time..days./365.25, OS.ID) ~ cluster, 
+                        data = df)
+      p_OS <- SurvivalPlot(fit=fit_OS,
+                        LegendTitle=paste0("Cluster is", x), 
+                        timeUnit="Years", 
+                        colors=cc_clusters[x]) +
+        labs(title=paste0("OS: Cluster ", x)) +
+        annotate("text", x=1,y=0.05,label=paste0("N=",nrow(df)), size=5) +
+        annotate("text", x=5,y=1.0,label=paste0("Major Subtype:",
+                                                unique(df$Major_Subtype_in_cluster)))
+  
+      fit_EFS <- survfit(Surv(EFS.time..days./365.25, Event.ID) ~ cluster,
+                         data = df)
+      p_EFS <- SurvivalPlot(fit=fit_EFS,
+                        LegendTitle=paste0("Cluster is", x), 
+                        timeUnit="Years", 
+                        colors=cc_clusters[x]) +
+        labs(title=paste0("EFS: Cluster ", x)) +
+        annotate("text", x=1,y=0.05,label=paste0("N=",nrow(df)), size=5) +
+        annotate("text", x=5,y=1.0,label=paste0("Major Subtype:",
+                                            unique(df$Major_Subtype_in_cluster)))
+                   
+      return(list(OS=p_OS,EFS=p_EFS))}
+  })
+  
+  
+  OS_KM <- lapply(cluster_KM,`[[`, 1)
+  EFS_KM <- lapply(cluster_KM,`[[`, 2)
+  
+  idx <- sapply(OS_KM, length) > 0
+  OS_KM <- OS_KM[idx]
+  EFS_KM <- EFS_KM[idx]
+
+
+  df <- group_by(outcome_data,AML_Subtype) %>% 
+    filter(sum(Subtype_Outlier_by_cluster == "Other Clusters") >= 3 & 
+         sum(Subtype_Outlier_by_cluster == "Majority Cluster") >= 3) 
+
+  KM.bySubtype <- KM.plots(df = df,
+                         group_vars = "AML_Subtype",
+                         type = "OS",
+                         covariate = "Subtype_Outlier_by_cluster",
+                         cohort = "1031", 
+                         riskTable = TRUE)
+
+  temp <- outcome_data %>%
+    mutate(cluster=paste0("Cluster_",as.character(cluster))) %>%
+    group_by(cluster, Major_vs_minor_Subtype_in_Cluster) %>%  
+    mutate(N_type_per_cluster=case_when(
+      Major_vs_minor_Subtype_in_Cluster == "Minor Subtypes" ~
+        sum(Major_vs_minor_Subtype_in_Cluster == "Minor Subtypes"),
+      grepl("Major Subtype", Major_vs_minor_Subtype_in_Cluster) ~
+        sum(grepl("Major Subtype", Major_vs_minor_Subtype_in_Cluster)))) %>%
+    ungroup() %>%
+    group_by(cluster) %>%
+    filter(min(N_type_per_cluster) >= 3 & 
+             length(unique(Major_vs_minor_Subtype_in_Cluster)) > 1) %>%
+    ungroup() 
+  
+  KM.withinClusters <- KM.plots(df = temp,
+                                 group_vars = "cluster",
+                                 type = "OS",
+                                 covariate = "Major_vs_minor_Subtype_in_Cluster",
+                                 cohort = "1031", 
+                                 riskTable = FALSE)
+
+  KM.KMT2A <- KM.plots(df = filter(outcome_data, AML_Subtype=="KMT2A") %>%
+                                  group_by(cluster) %>% 
+                                  filter(n()>=3) %>%
+                                  ungroup() %>%
+                                filter(Major_Subtype_in_cluster=="KMT2A"),
+                           group_vars = NULL,
+                           type = "OS",
+                           covariate = "cluster",
+                           cohort = "1031", 
+                           riskTable = FALSE)
+  
+  all_plots <- list(OS_KM=OS_KM,
+                    EFS_KM=EFS_KM,
+                    KM.bySubtype=KM.bySubtype,
+                    KM.withinClusters=KM.withinClusters,
+                    KM.KMT2A=KM.KMT2A)
+  return(all_plots)
+  
+}  
+```
+
+
+###UMAP Workflow 
+
+```{r}
+UMAP_workflow <- function(TFIDF_Matrix, 
+                          samples_vector,
+                          sample_info_df,
+                          cc,
+                          Columns_for_Plots,
+                          k2=12,res2=0.007,
+                          addl_color_vector=colors37,
+                          scale_data=FALSE, uniqID=""){
+  # TFIDF_Matrix is the subset TFIDF transformed counts that has been subbset to include mean vs dispersion selected features 
+  #samples_vector is a character vector of sample IDs to include in the analysis
+  # sample_info_df,
+  #cc is a list of colorcodes, where colorcodes are named vectors for columns of interest with the "Group"="Color" format
+  #Columns_for_Plots is a vector of columnnames (columns of interest) to use for colors in 2d scatter plots. must be the same columns as those used for the colorcodes in cc
+  # addl_color_vector is a simple character vector of additional colors,
+  #scale_data is aboolean on whether TFIDF transformed counts should be center scaled
+  library(survival)
+  library(GGally)
+  library(RColorBrewer)
+  
+  PA.file <- file.path(SCRATCH,"tmp",paste0("PA_",uniqID, ".RDS"))
+  if(file.exists(PA.file)){
+    PA <- readRDS(PA.file)
+  }else{
+    #Plus PCA (Jackstraw) Feature Selection 
+    PA = permutationPA(as.matrix(TFIDF_Matrix[,samples_vector]), 
+                     B = 100, #100 iterations
+                     threshold = 0.05, 
+                     seed=2020)
+    gc()
+    saveRDS(PA,PA.file)
+  }
+  
+  pa.plot <- plot(PA$p,  pch = 20, 
+       main = "Permutation Parallel Analysis P-values",
+       ylab = "P-values", xlab = "Principal Component")
+  
+  #select number of pricinipal components that encompass most variance explained
+  N_comp <- PA$r
+  
+  jackpca.file <- file.path(SCRATCH,"tmp",paste0("JackPCA_",uniqID, ".RDS"))
+  if(file.exists(jackpca.file)){
+    out <- readRDS(jackpca.file)
+  }else{
+    out <-  jackstraw_pca(dat=as.matrix(TFIDF_Matrix[,samples_vector]), 
+                        r=N_comp,
+                        s=100, B=100,
+                        verbose = TRUE, 
+                        seed=2020) 
+    gc()
+    saveRDS(out,jackpca.file)
+  }
+  
+  #Select genes significantly assoc. with principal components
+  input_features <- rownames(TFIDF_Matrix)[out$p.value < 0.05] 
+
+  #Run UMAP on selected Featrues
+  indata <- as.matrix(TFIDF_Matrix[input_features, samples_vector])
+  metadata <- sample_info[samples_vector,]
+  
+  umap.file <- file.path(SCRATCH,"tmp",paste0("UMAP_",uniqID, ".RDS"))
+  if(file.exists(umap.file)){
+    umap_res <- readRDS(umap.file)
+  }else{
+    set.seed(2020)
+    umap_res <- UMAP_function(data_matrix=indata,
+                              metadata = metadata,
+                              N = 3, 
+                              scale_data = scale_data, 
+                              threads = 4)
+    umap_res$Sample <- rownames(umap_res)
+    gc()
+    saveRDS(umap_res, umap.file)
+  }
+
+
+  #2D Plots 
+  plots_UMAP <- scatter_plots_2d(umap_df = umap_res,
+                                 Columns = Cols, ColorCodes = cc)
+
+  ## Leiden Clustering on UMAP dimensions
+  clusterColors <- c(brewer.pal(n=11,"Spectral")[-c(4:7)], 
+                     brewer.pal(n=9,"Set1")[-2], 
+                     brewer.pal(n=7,"Dark2")[-2], 
+                     addl_color_vector) 
+  
+  set.seed(2020)
+  cr <- seqGlue::cluster(as.matrix(umap_res[,c("x","y","z")]),
+              pd = umap_res[,c(4:10)], 
+              verbose=T, 
+              num_iter=100,
+              random_seed=2020,
+              resolution = 0.01) #fewer clusters
+  gc()
+  Num_clusters <- length(unique(cr$clusters))
+  clust_col <- paste0("cluster_k",Num_clusters)
+  umap_res[,clust_col] <- cr$clusters
+  clustColor <-  clusterColors[1:Num_clusters] %>% set_names(1:Num_clusters)
+
+    #this is becuase changing the datasets used in clustering results in different groups reaching the >= 10   samples to be given a category/color
+  incl <- intersect(names(cc$AML_Subtype), unique(umap_res$AML_Subtype))
+  
+  cluster_plots1 <- cluster_plots(umap_results = select(umap_res, cluster = !! clust_col, everything()),
+                                        colorCodes = clustColor, 
+                                        colorsSubtypes = cc$AML_Subtype[incl])
+
+  ### Modify Clustering Resolution
+  #using Louvain/Leiden community detection, and returns the cluster assignments. 
+  set.seed(2020)
+  cr2 <- seqGlue::cluster(as.matrix(umap_res[,c("x","y","z")]),
+              pd = umap_res[,c(4:10)], 
+              verbose=T, 
+              num_iter=100,
+              random_seed=2020,
+              k=k2,
+              resolution = res2) #more clusters
+  gc()
+  
+  Num_clusters2 <- length(unique(cr2$clusters))
+  clust_col2 <- paste0("cluster_k",Num_clusters2)
+  umap_res[,clust_col2] <- cr2$clusters
+  clustColor2 <-  clusterColors[1:Num_clusters2] %>% set_names(1:Num_clusters2)
+
+
+  #this is becuase changing the datasets used in clustering results in different groups reaching the >= 10 samples to be given a category/color
+  incl <- intersect(names(cc$AML_Subtype), unique(umap_res$AML_Subtype))
+  #just for the function to use correct column, select changes the name of the cluster col
+  cluster_plots2 <- cluster_plots(umap_results = select(umap_res, cluster = !! clust_col2, everything()), 
+                                  colorCodes = clustColor2, 
+                                  colorsSubtypes = cc$AML_Subtype[incl])
+  
+  
+  
+  #Outcome Analysis Clustering
+  outcome_df1 <- outcome_by_cluster_df(umap_results = select(umap_res,
+                                                             cluster = !! clust_col,
+                                                             everything()))
+  
+  try(cluster_KM1 <- KM_plots_workflow(outcome_data = outcome_df1, 
+                                        cc_clusters=clustColor),
+      silent = TRUE)
+
+  outcome_df2 <- outcome_by_cluster_df(umap_results = select(umap_res, 
+                                                             cluster = !! clust_col2,
+                                                             everything())) 
+  
+  try(cluster_KM2 <- KM_plots_workflow(outcome_data = outcome_df2, 
+                                       cc_clusters=clustColor2), 
+      silent=TRUE)
+
+
+
+  #Results list  
+  results <- list(input_features=input_features,
+                  umap_res=umap_res,
+                  umap_2D_scatter=plots_UMAP,
+                  outcome_df1=outcome_df1,
+                  outcome_df2=outcome_df2,
+                  cluster_plots1=cluster_plots1,
+                  cluster_plots2=cluster_plots2)
+  if(exists("cluster_KM1")){
+    results[["cluster_KM1"]]<- cluster_KM1
+  }else if(exists("cluster_KM2")){
+    results[["cluster_KM2"]] <- cluster_KM2 
+  }
+  
+  return(results)
+  
+}
+```
+
+
+#Read in the counts data
+
+```{r}
+cts <- readRDS("Expression_Data/TARGET_AML_DSAML_MPN_NBM_Ribodepleted_dupGenesRemoved_Fractionalcounts.RDS")
+
+dim(cts) #51573  2345
+```
+
+
+#Read in the Clinical Data
+
+```{r message=FALSE, warning=FALSE}
+merged <- read_csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_2.12.20.csv"))
+
+merged <- merged %>%
+  filter(USI != "Unknown")
+
+dim(merged) #2314  145
+```
+
+```{r}
+CEBPA <- read.csv(file.path(PROJHOME,"2020.02.27_CEBPA_doubleMut_bZip_singleMut/Mutation_data/CEBPA_oncoprint.csv"),
+                  na.strings = c("#N/A","NA","N/A")) %>% 
+  mutate(CEBPA=ifelse(grepl("Mutant",CEBPA.Allelic.Status ),
+                      "Yes","No")) 
+
+table(CEBPA$CEBPA, CEBPA$CEBPA.Allelic.Status, useNA='ifany')
+```
+
+```{r}
+CEBPA2 <- read.csv(file.path(PROJHOME,"2020.02.27_CEBPA_doubleMut_bZip_singleMut/Mutation_data/CEBPA_mutation_allelic_status_RR.csv"),
+                  na.strings = c("#N/A","NA","N/A")) 
+
+table(CEBPA2$CEBPA.Mutant,
+      CEBPA2$CEBPA.Allelic.Status,
+      useNA='ifany')
+```
+
+```{r}
+CEBPA3 <- read.csv(file.path(PROJHOME,"2020.02.27_CEBPA_doubleMut_bZip_singleMut/Mutation_data/CEBPA_oncoprint_input_KT.csv"),
+                   na.strings = c("#N/A","NA","N/A")) %>% 
+  filter(grepl("CEBPA", Gene)) 
+
+head(CEBPA3)
+table(CEBPA3$Gene)
+sum(duplicated(CEBPA3$Sample)) #196
+```
+
+```{r}
+CEBPA4 <- read.csv(file.path(PROJHOME,"2020.02.27_CEBPA_doubleMut_bZip_singleMut/CEBPA_heatmap_annotationBar_data_03.23.2020.csv"), na.strings = c("#N/A","NA","N/A")) %>% 
+  filter(grepl("-dm|bZip", Allelic.Status))
+
+head(CEBPA4)
+table(CEBPA4$Allelic.Status)
+sum(duplicated(CEBPA4$USI)) #0
+```
+
+
+```{r}
+sample_info <- read.csv("TARGET_AML_Ribodepleted_Master_Manifest_2.14.20.csv") %>%
+  mutate_at(vars(Mutations.Category), ~case_when(
+    grepl("AML", .) ~ gsub("OtherAML", "AML", .), 
+    is.na(.) ~ Group, 
+    TRUE ~ .)) %>%
+  mutate_at(vars(CEBPA.mutation.), #second check that all CEBPA are included
+            ~case_when(
+              USI %in% CEBPA$USI ~ "Yes",
+              USI %in% CEBPA2$USI ~ "Yes",
+              TRUE ~ CEBPA.mutation.)) %>%
+  left_join(., select(CEBPA, USI, Diff1=CEBPA.Allelic.Status),
+            by="USI") %>% 
+  #Same patient found in both datasets 1,2,3 and 4...
+  # left_join(., select(CEBPA2, USI, Diff2=CEBPA.Allelic.Status),
+  #           by="USI") %>% 
+  # left_join(., select(CEBPA3, Sample, Diff3=Gene),
+  #           by=c("Reg."="Sample")) %>% 
+  # left_join(., select(CEBPA4, USI, Diff4=Allelic.Status),
+  #           by="USI") %>%
+  mutate_at(vars(CEBPA.Double.Single.Allelic.Status), ~case_when(
+    grepl("None|Unknown", .) & CEBPA.mutation. == "Yes" ~ Diff1,
+    grepl("None|Unknown", .) & Group=="AML" ~ AML_Subtype,
+    grepl("Unknown", .)  ~ Group,
+    is.na(.) ~ Group,
+    TRUE ~ .))  %>%
+  mutate_at(vars(CEBPA.Double.Single.Allelic.Status), ~case_when(
+    grepl("del5q|ERG|ETV6|KAT6A|monosomy|RBM15|RUNX1-CBFA2T3", .) ~ "AML",
+    TRUE ~ .)) %>%
+  mutate_at(vars(Protocol), ~ifelse(.=="",NA,.)) %>%
+  mutate_at(vars(GO.Treatment), ~ifelse(grepl("Arm ",Treatment.Arm), NA, .)) %>%
+  mutate_at(vars("Time_point"), ~ifelse(grepl("NBM",.),"control",.)) %>%
+  set_rownames(.$Sample)
+
+head(sample_info[,1:4])
+dim(sample_info) #2345  152
+
+Cols <- c("Group","Time_point", "Tissue", "Protocol", "AML_Subtype","Batch", "Mutations.Category","CEBPA.Double.Single.Allelic.Status")
+# lapply(Cols, function(x) table(sample_info[,x],
+#                                useNA='ifany'))
+```
+
+```{r}
+table(sample_info$CEBPA.mutation.,
+      sample_info$CEBPA.Double.Single.Allelic.Status)
+```
+
+
+
+#Colors for Plotting
+
+```{r}
+col2hex <- function(col, alpha) rgb(t(col2rgb(col)), 
+                                    alpha=alpha, maxColorValue=255)
+SFtheme<-theme_bw() +
+    theme(legend.background = element_rect(fill = "transparent",colour = NA),
+          plot.background = element_rect(fill = "transparent",colour = NA),
+          panel.background = element_rect(fill = "transparent",colour = NA),
+          legend.key = element_rect(fill = "transparent",colour = NA),
+    axis.text.x=element_text(angle=90, hjust=0.95,vjust=0.2))
+```
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+
+# barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+```{r fig.height=4}
+subtype.levels <- c("AML", "CBFA2T3-GLIS2", "CBFB-MYH11", "NBM",
+                    "DEK-NUP214", "del5q",  "DS", "ERG-HNRNPH1",
+                    "ETV6-MNX1", "FUS-ERG",
+                    "KAT6A-CREBBP", "KMT2A", "monosomy7",
+                    "MPN", "No.Primary.Fusion.CNV",
+                    "NUP98-KDM5A", "NUP98-NSD1","RBM15-MKL1",
+                    "RUNX1-CBFA2T3","RUNX1-RUNX1T1","TMD",
+                    "CD34_NBM")
+
+df <- sample_info%>% 
+  select(Cols) %>%
+  #not including cell lines or flow sorted samples in the clustering
+  filter(Group!="CellLine", Group != "FlowSorted") %>%
+  mutate(AML_Subtype=factor(AML_Subtype, levels=subtype.levels))
+
+cc <- colorCodes_aheatmap(df=df)
+cc <- lapply(cc, function(x){x[["AML"]] <- "grey80"; return(x)})
+cc <- lapply(cc, function(x){x[["NBM"]] <- "white"; return(x)})
+#Manually Update AML subtype colors
+cc[c(5,8)] <- lapply(cc[c(5,8)], function(x){
+  # x[["NBM"]] <- "white"; 
+  x[["No.Primary.Fusion.CNV"]] <- "azure4"
+  x[["RUNX1-RUNX1T1"]] <- "sienna4"
+  x[["CBFB-MYH11"]] <- "red"
+  x[["KMT2A"]] <- "khaki2"
+  x[["MPN"]] <- "orchid1"
+  x[["NUP98-KDM5A"]] <- "magenta"
+  x[["NUP98-NSD1"]] <- "steelblue1"
+  x[["TMD"]] <- "green4"
+  return(x)})
+
+
+
+# barplot(rep(1,length(cc$AML_Subtype)), col=cc$AML_Subtype, names.arg=cc$AML_Subtype,las=2)
+par(mar=c(12,4,4,2))
+# barplot(rep(1,length(cc$AML_Subtype)), col=cc$AML_Subtype, names.arg=names(cc$AML_Subtype),las=2)
+# barplot(rep(1,length(cc$Mutations.Category)), col=cc$Mutations.Category, 
+#         names.arg=names(cc$Mutations.Category),las=2)
+# barplot(rep(1,length(cc$CEBPA.Double.Single.Allelic.Status)), col=cc$CEBPA.Double.Single.Allelic.Status, 
+#         names.arg=names(cc$CEBPA.Double.Single.Allelic.Status),las=2)
+```
+
+```{r}
+# saveRDS(cc,"UMAP_ColorCodes_2.18.20.RDS")
+```
+
+
+#Filter Low read counts and select input samples
+
+```{r}
+identical(colnames(cts), sample_info$Sample)
+cts <- as.matrix(cts[rowSums(cts)>= 10, ]) 
+
+dim(cts) #48230  2345
+
+```
+
+
+
+#For Accenture
+
+```{r}
+
+samps_dx <- filter(sample_info,
+                Group != "CellLine", 
+                Group != "FlowSorted",
+                Group != "MPN",
+                !grepl("DS|TMD", Group, ignore.case = T),
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("relapse", Time_point, ignore.case = T), # dont include relapses here
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+
+samps_rlps <- filter(sample_info,
+                Group != "CellLine", 
+                Group != "FlowSorted",
+                Group != "MPN",
+                !grepl("DS|TMD", Group, ignore.case = T),
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("diagnostic", Time_point, ignore.case = T), 
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+
+samps_ds <- filter(sample_info,
+                Group != "CellLine", 
+                Group != "FlowSorted",
+                Group != "MPN",
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("AML", Group, ignore.case = T), 
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+```
+
+```{r}
+table(sample_info[samps_dx,"Group"])
+table(sample_info[samps_rlps,"Group"])
+table(sample_info[samps_ds,"Group"])
+
+# write.csv(cts[,samps_dx], "Expression_Data/TARGET_AML_Diagnostic_NBM_CD34NBM_Counts.csv")
+# write.csv(cts[,samps_rlps], "Expression_Data/TARGET_AML_Relapse_NBM_CD34NBM_Counts.csv")
+# write.csv(cts[,samps_ds], "Expression_Data/TARGET_AML_DS_TMD_NBM_CD34NBM_Counts.csv")
+```
+
+### Additiona CDE 
+
+```{r}
+Add.Cols <- c("Sample","Group",
+"AML_Subtype",
+"Time_point",
+"Age.in.years",
+"Age.Category",
+"FAB_or_WHO.Classification",
+'Sex',"Race","Ethnicity",
+"Ethnic.Classification","WBC..x10.3.MicroLiter..levels","Bone.marrow.leukemic.blast.percentage....","Peripheral.blasts....","Blast.percent..by.flow.","MRD.at.end.of.course.2","MRD.at.end.of.course.1","MRD...at.end.of.course.1","MRD...at.end.of.course.2","OS.time..days.","OS.event.ID","EFS.time..days.","EFS.event.type.ID","FLT3.ITD.positive.","NPM.mutation.","WT1.mutation.","CEBPA.mutation.", "Mutations.Category", "Primary.Fusion.CNV", "Additional.Fusions.CNV", "USI","Protocol","Treatment.Arm","GO.Treatment")
+
+# write.csv(sample_info[samps_dx,Add.Cols],
+#           "TARGET_AML_Diagnostic_NBM_CD34NBM_Clinical_addendum.csv")
+# write.csv(sample_info[samps_rlps,Add.Cols],
+#           "TARGET_AML_Relapse_NBM_CD34NBM_Clinical_addendum.csv")
+# write.csv(sample_info[samps_ds,Add.Cols[1:4]],
+#           "TARGET_AML_DS_TMD_NBM_CD34NBM_Clinical_addendum.csv")
+```
+
+### TMM CPM Counts 
+
+```{r}
+library(limma)
+library(edgeR)
+```
+
+```{r}
+dge.dx <- DGEList(counts=cts[,samps_dx])
+dge.dx <- calcNormFactors(dge.dx)
+# dge.dx$samples[1:5,]
+cpm.dx <- cpm(dge.dx,
+              normalized.lib.sizes = TRUE,
+              log=FALSE)
+dim(cpm.dx)
+
+# write.csv(cpm.dx,"Expression_Data/TARGET_AML_Diagnostic_NBM_CD34NBM_TMM_CPM.csv")
+```
+
+```{r}
+dge.ds <- DGEList(counts=cts[,samps_ds])
+dge.ds <- calcNormFactors(dge.ds)
+# dge.ds$samples[1:5,]
+cpm.ds <- cpm(dge.ds,
+              normalized.lib.sizes = TRUE,
+              log=FALSE)
+dim(cpm.ds)
+# write.csv(cpm.ds, "Expression_Data/TARGET_AML_Relapse_NBM_CD34NBM_TMM_CPM.csv")
+```
+
+```{r}
+dge.rlps <- DGEList(counts=cts[,samps_rlps])
+dge.rlps <- calcNormFactors(dge.rlps)
+# dge.rlps$samples[1:5,]
+cpm.rlps <- cpm(dge.rlps,
+              normalized.lib.sizes = TRUE,
+              log=FALSE)
+dim(cpm.rlps)
+# write.csv(cpm.rlps, "Expression_Data/TARGET_AML_DS_TMD_NBM_CD34NBM_TMM_CPM.csv")
+```
+
+
+#UMAP Diagnostic Only
+
+##CEBPA 
+
+```{r}
+#removing TARGET.20.PAXLWH.CD34NEG.01R and other associated experimenal samples
+samps_cebpa <- filter(sample_info,
+                !Group %in% c("CellLine","FlowSorted", 
+                              "DS", "TMD", "MPN","NBM","CD34_NBM"), 
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("relapse", Time_point, ignore.case = T), # dont include relapses here
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+
+cts_cebpa <- cts[, samps_cebpa]
+cts_cebpa <- as.matrix(cts_cebpa[rowSums(cts_cebpa)>= 10, ])
+
+dim(cts_cebpa) #47568  1492
+
+# lapply(Cols, function(x) table(sample_info[samps_cebpa,x],
+#                                useNA='ifany'))
+```
+
+
+```{r}
+#TFIDF TRANSFORMED Counts
+# Term Frequency - Inverse Document Frequency (TF-IDF) 
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6101073/
+cell_total <- apply(cts_cebpa, 2, sum)
+geomean <- exp(mean(log(cell_total)))
+sf <- cell_total/geomean
+sf.scaled <- t(t(cts_cebpa)/sf)
+
+
+tf_cebpalog <- tf_idf_transform(log2(sf.scaled+1))
+tf_cebpa <- tf_idf_transform(sf.scaled)
+# rm(sf.scaled)
+gc()
+
+# Mean vs Dispersion Feature Selection 
+obj <- calc_dispersion(cts_cebpa, removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+gc()
+
+sg_cebpa <- get_selected_genes(select_genes(obj, top_n=NULL))
+tf_cebpa <- tf_cebpa[sg_cebpa,]
+tf_cebpalog <- tf_cebpalog[sg_cebpa,]
+
+dim(tf_cebpa) #10998  1492
+dim(tf_cebpalog)
+```
+
+quantile(tf_cebpa)
+           0%           25%           50%           75%          100% 
+-0.9842431439  0.0000000000  0.0000000000  0.0000181016  0.9987993890 
+
+quantile(tf_cebpalog)
+           0%           25%           50%           75%          100% 
+-0.0003616276  0.0000000000  0.0000000000  0.0001618140  0.3520306408
+
+
+```{r}
+sample_info_cebpa <- sample_info[samps_cebpa,]
+uidl <- paste(c(dim(tf_cebpa),"cebpa","log2"),collapse = "_")
+
+umap_cebpalog <- UMAP_workflow(TFIDF_Matrix = tf_cebpalog, 
+                          samples_vector = samps_cebpa,
+                          sample_info_df = sample_info_cebpa,
+                          cc = cc, 
+                          k2=15,res2=0.05,
+                          uniqID=uidl)
+
+
+# saveRDS(umap_cebpalog,"TARGET_AML_sg6818_log2Counts_UMAP_CEBPA_Results.RDS")
+```
+
+```{r}
+table(sample_info_cebpa$CEBPA.Double.Single.Allelic.Status)
+```
+
+```{r fig.height=20, fig.width=20}
+# plot(umap_cebpalog$umap_2D_scatter)
+# umap_cebpalog$cluster_plots2
+```
+
+```{r}
+sample_info_cebpa <- sample_info[samps_cebpa,]
+
+uid <- paste(c(dim(tf_cebpa),"cebpa"),collapse = "_")
+umap_cebpa <- UMAP_workflow(TFIDF_Matrix = tf_cebpa, 
+                          samples_vector = samps_cebpa,
+                          sample_info_df = sample_info_cebpa,
+                          cc = cc, 
+                          k2=12,res2=0.01,
+                          uniqID=uid)
+#UMAP input 6816 numeric columns after PCA selection
+# saveRDS(umap_cebpa,"TARGET_AML_sg6818_UMAP_CEBPA_Results.RDS")
+```
+
+```{r}
+identical(umap_cebpa$umap_res$USI, sample_info_cebpa$USI)
+umap_cebpa$umap_res[["CEBPA.Double.Single.Allelic.Status"]] <- pull(sample_info_cebpa, CEBPA.Double.Single.Allelic.Status)
+
+
+table(umap_cebpa$umap_res$CEBPA.Double.Single.Allelic.Status)
+```
+
+```{r}
+# length(umap_cebpa$input_features) #6816
+# write.csv(umap_cebpa$input_features,"TARGET_AML_sg6816_forCEBPA_Analysis_3.10.20.csv",
+          # row.names = FALSE)
+```
+
+```{r}
+# head(umap_cebpa$umap_res)
+# ggsave("TARGET_AML_forCEBPA_2D_UMAP_Scatterplot.pdf",
+#        umap_cebpa$umap_2D_scatter, device = "pdf",
+#        height = 20, width = 20)
+```
+
+
+```{r fig.height=6, fig.width=10}
+umap_cebpa$cluster_plots2
+```
+
+
+
+##AML Batch1/2 and "Relapse" Batch Samples 
+
+```{r}
+#removing TARGET.20.PAXLWH.CD34NEG.01R and other associated experimenal samples
+samps12R <- filter(sample_info,
+                Group != "CellLine", 
+                Group != "FlowSorted",
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("relapse", Time_point, ignore.case = T), # dont include relapses here
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+
+cts.subset12R <- cts[, samps12R]
+cts.subset12R <- as.matrix(cts.subset12R[rowSums(cts.subset12R)>= 10, ])
+
+dim(cts.subset12R) #47838  1816
+
+# lapply(Cols, function(x) table(sample_info[samps,x],
+#                                useNA='ifany'))
+
+```
+
+```{r}
+#TFIDF TRANSFORMED Counts
+# Term Frequency - Inverse Document Frequency (TF-IDF) 
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6101073/
+data12R <- t(t(cts.subset12R)/estimateSizeFactorsForMatrix(cts.subset12R))
+tf12R <- tf_idf_transform(data12R)
+rm(data12R)
+gc()
+
+# Mean vs Dispersion Feature Selection 
+obj <- calc_dispersion(cts.subset12R, removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+gc()
+
+sg12R <- get_selected_genes(select_genes(obj, top_n=NULL))
+tf12R <- tf12R[sg12R,]
+dim(tf12R) #11072  1816
+```
+
+```{r}
+uid <- paste(dim(tf12R),collapse = "_")
+umap_allDX <- UMAP_workflow(TFIDF_Matrix = tf12R, 
+                          samples_vector = samps12R,
+                          sample_info_df = sample_info,
+                          cc = cc, 
+                          uniqID=uid)
+```
+
+
+
+
+
+##AML Batch1/2  Only
+
+Although running this workflow with different UIDs, does seem to have the same output??? So just reformatting my code and maybe where the seed is called is affecting the orginal UMAP res??? 
+
+Because its the same input genes from jackstraw PCA..... but the one run 2 weeks ago has different coordinates. 
+
+Solution: *It needs to be only 1 core to be deterministic*
+
+
+```{r}
+orig <- read.csv("Results/Dx_DS_MPN_bulkNBM_PCAselect_sg7655/TARGET_AML_sg7655_noScale_PCAselect_k31_CDE_2.14.20.csv") %>% 
+  select(Sample, x,y,z,AML_Subtype)
+head(orig)
+dim(orig)
+# write.csv(orig, "TARGET_AML_batch12_sg7655_UMAP_Coordinates.csv")
+```
+
+
+
+```{r}
+#removing TARGET.20.PAXLWH.CD34NEG.01R and other associated experimenal samples
+samps_b12 <- filter(sample_info,
+                Group != "CellLine", 
+                Group != "FlowSorted",
+                !grepl("replicate", Sample, ignore.case = T),
+                !grepl("relapse", Time_point, ignore.case = T), # dont include relapses here
+                !grepl("rlps", Batch),
+                !grepl("TARGET.20.PAXLWH\\.[A-Z]",Sample))$Sample
+
+cts.subset_b12 <- cts[, samps_b12]
+cts.subset_b12 <- as.matrix(cts.subset_b12[rowSums(cts.subset_b12)>= 10, ])
+dim(cts.subset_b12) #47758  1694
+
+# lapply(Cols, function(x) table(sample_info[samps_b12, x],
+#                                useNA='ifany'))
+```
+
+
+```{r}
+#TFIDF TRANSFORMED Counts
+# Term Frequency - Inverse Document Frequency (TF-IDF) 
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6101073/
+data <- t(t(cts.subset_b12)/estimateSizeFactorsForMatrix(cts.subset_b12))
+tf_b12 <- tf_idf_transform(data)
+rm(data)
+gc()
+
+# Mean vs Dispersion Feature Selection 
+obj_b12 <- calc_dispersion(cts.subset_b12, removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+sg_b12 <- get_selected_genes(select_genes(obj_b12, top_n=NULL))
+tf_b12 <- tf_b12[sg_b12,]
+dim(tf_b12) #11187  1694
+gc()
+```
+
+```{r}
+# uid=paste(dim(tf_b12), collapse = "_")
+uid=paste(c(dim(tf_b12),"_Second"), collapse = "_")
+umap_b12 <- UMAP_workflow(TFIDF_Matrix = tf_b12, 
+                          samples_vector = samps_b12,
+                          sample_info_df = sample_info,
+                          cc = cc,
+                          uniqID=uid)
+```
+
+```{r}
+dim(umap_b12$umap_res)
+head(umap_b12$umap_res[,1:5])
+length(umap_b12$input_features) #7,655
+```
+
+
+
+```{r}
+#For Accenture
+# write.csv(as.data.frame(as.matrix(tf_b12[umap_b12$input_features, ])), "TARGET_AML_TFIDF_Transformed_LibrarySizeScaled_Counts.csv")
+```
+
+```{r}
+# write.csv(tf_b12[,input_features],"TARGET_RBD_sgXXX_batch12_TFIDF_Normalized_RNAseq_Counts_2.18.20.csv")
+# write.csv(umap_res,"TARGET_RBD_sgXXX_batch12_CDE_2.18.20.csv")
+```
+
+
+#CEBPA Figures for Manuscript 
+
+for Katherine Tarlock 
+
+```{r}
+res <- umap_cebpa$umap_res
+#chisquare test for cluster enrichment?
+t <- filter(res, CEBPA.mutation.=="Yes") %>%
+  droplevels()
+tab <- table(t$CEBPA.Double.Single.Allelic.Status, t$cluster_k27, useNA='ifany')
+
+tab
+
+sum(tab[1,]) #60
+sum(tab[2,]) #13
+
+round(54/73*100, digits=1)
+```
+
+```{r}
+for_chi_test <- res %>% 
+  mutate(CEBPA.pos=ifelse(grepl("Mutant", CEBPA.Double.Single.Allelic.Status), "Yes","No"), 
+         Cluster5=ifelse(cluster_k27 == 5, "Yes","No")) %>% 
+  select(CEBPA.pos,Cluster5)
+  # group_by(CEBPA.pos,Cluster5) %>% 
+  # summarise(N=n()) 
+
+conf.mat.c5 <- table(for_chi_test$CEBPA.pos, for_chi_test$Cluster5)
+conf.mat.c5
+chisq.test(conf.mat.c5)
+```
+
+```{r}
+for_csf3r_test <- res %>% 
+  filter(grepl("Mutant", CEBPA.Double.Single.Allelic.Status)) %>%
+  mutate(CEBPA.CSF3R=ifelse(!grepl("No|Unknown", CSF3R), "CSF3R.CEBPA", "CEBPA.other"),
+         Cluster5=ifelse(cluster_k27 == 5, "Cluster5","OtherCluster")) %>%
+  droplevels()
+  # select(CEBPA.CSF3R,Cluster5)
+
+conf.mat.csf3r <- table(for_csf3r_test$CEBPA.CSF3R, for_csf3r_test$Cluster5)
+conf.mat.csf3r
+chisq.test(conf.mat.c5)
+```
+
+
+```{r}
+conf.mat <- matrix(c(46,8,60-46,13-8), nrow=2, ncol=2, 
+                   dimnames = list(c("DM","SM"),c("Cluster5", "OtherClusters")))
+
+conf.mat
+
+chisq.test(conf.mat)
+```
+
+
+Single Mutant, Double Mutant, KMT2A, RUNX1-RUNX1T1, CBFB-MYH11, DEK-NUP214, NUP98-NSD1, NUP98-KDM5A, CBFA2T3-GLIS2,  No.Primary.Fusion.CNV,  AML     
+
+ colors <- c("#E41A1C", "#377EB8" ,"#4DAF4A" ,
+                 "#F781BF","blue1", "darkslategray3","burlywood3", "#984EA3", "#FF7F00",
+                "seagreen2", "maroon", "orchid", "cornflowerblue", "yellow2",
+                "darkblue", "azure4", "chartreuse1", "orange1",
+                "deeppink", "darkslategray1", "green4", "navajowhite2",
+                "brown3", "darkgoldenrod3", "deepskyblue1", "lightcoral",
+                "mediumorchid", "darkmagenta"
+                
+```{r fig.height=3}
+flevels <- rev(c("Single Mutant", 
+                                         "Double Mutant",
+                                     "RUNX1-RUNX1T1",
+                                     "CBFB-MYH11",
+                                     "NUP98-NSD1",
+                                     "DEK-NUP214",
+                                     "NUP98-KDM5A",
+                                     "CBFA2T3-GLIS2",
+                                     "NPM1",
+                                     "FLT3-ITD",
+                                     "No.Primary.Fusion.CNV",
+                                     "AML",
+                                     "KMT2A"))
+
+res <- umap_cebpa$umap_res %>%
+  mutate_at(vars(CEBPA.Double.Single.Allelic.Status), 
+            ~case_when(
+              FLT3.ITD.positive. == "Yes" &
+                CEBPA.Double.Single.Allelic.Status %in%
+                c("No.Primary.Fusion.CNV","AML") ~ "FLT3-ITD",
+              NPM.mutation. == "Yes" &
+                CEBPA.Double.Single.Allelic.Status %in%
+                c("No.Primary.Fusion.CNV","AML") ~ "NPM1",
+              TRUE ~ .)) %>%
+  mutate_at(vars(CEBPA.Double.Single.Allelic.Status),
+                 ~factor(., levels=flevels))
+
+
+# cebpa_colors <- colorCodes_aheatmap(df=select(res,CEBPA.Double.Single.Allelic.Status))[[1]]
+cebpa_colors <- NULL
+cebpa_colors["No.Primary.Fusion.CNV"] <- "azure4"
+cebpa_colors["AML"] <- "grey80"
+cebpa_colors["NPM1"] <- "#FDDAEC"
+cebpa_colors["FLT3-ITD"] <- "#B3CDE3" #"#377EB8"
+cebpa_colors["KMT2A"] <- "khaki2"
+cebpa_colors["DEK-NUP214"] <-  "aquamarine3" #"darkslategray3"
+cebpa_colors["CBFB-MYH11"] <- "burlywood"
+cebpa_colors["CBFA2T3-GLIS2"] <- "firebrick3"
+cebpa_colors["RUNX1-RUNX1T1"] <- "sienna3"
+cebpa_colors["NUP98-KDM5A"] <- "navy"
+cebpa_colors["NUP98-NSD1"] <- "cornflowerblue"
+cebpa_colors["Single Mutant"] <- "magenta"
+cebpa_colors["Double Mutant"] <- "green2"
+
+par(mar=c(8,4,4,2))
+barplot(rep(1,length(cebpa_colors)), col=cebpa_colors, names.arg = names(cebpa_colors), las=2)
+```
+
+
+```{r}
+labs <- c("Single Mutant"="CEBPA single mutant", "Double Mutant"="CEBPA double mutant", 
+          "KMT2A"="KMT2A-rearranged", "RUNX1-RUNX1T1"="RUNX1-RUNX1T1",
+          "CBFB-MYH11"="CBFB-MYH11", 
+          "NUP98-NSD1"="NUP98-NSD1",
+          "DEK-NUP214"="DEK-NUP214", 
+          "NUP98-KDM5A"="NUP98-KDM5A",
+          "CBFA2T3-GLIS2"="CBFA2T3-GLIS2", 
+          "NPM1"="NPM1",
+          "FLT3-ITD"="FLT3-ITD",
+          "No.Primary.Fusion.CNV"="No Fusion/CNV",
+          "AML"="Other AML")
+
+thm <- theme(panel.background = element_rect(color = "black", fill="black"),
+            axis.text = element_text(size=22, color="black"),
+            axis.title = element_text(size=22, color="black")) 
+
+ellipse_dat <- res %>% 
+  # mutate_at(vars(CEBPA.Double.Single.Allelic.Status), ~as.character(.)) %>%
+  #grepl("RUNX1|DEK|NUP98|Mutant|KMT2A|CBFB|GLIS2"
+  filter(grepl("RUNX1|DEK|NUP98|Mutant|KMT2A|CBFB|GLIS2|NPM1|FLT3",
+               CEBPA.Double.Single.Allelic.Status)) %>% 
+  mutate(ellipse_groups=ifelse(grepl("Mutant",as.character(CEBPA.Double.Single.Allelic.Status)),"CEBPA", as.character(CEBPA.Double.Single.Allelic.Status))) %>% 
+  droplevels()
+
+
+
+ellipse_colors <- NULL
+ellipse_colors <- cebpa_colors[-c(1:2,10:11)]
+ellipse_colors["CEBPA"] <- "dodgerblue2"
+```
+
+### 2D Scatter plots
+
+```{r fig.height=7, fig.width=10}
+cebpa_dim12 <- ggplot(res,
+                      aes(x=x,y=y,color=CEBPA.Double.Single.Allelic.Status)) +
+      stat_ellipse(data=ellipse_dat,
+                   aes(x=x,y=y, fill=ellipse_groups),
+                   geom = "polygon",
+                   size=1.5,
+                   alpha=0.25,
+                   level = 0.75,
+                   inherit.aes = FALSE) +
+      # geom_point(size=3.0,alpha=1,shape=21, stroke = 0.2)+
+      geom_point(size=3.0,alpha=1,shape=19, stroke=0.2)+
+      scale_color_manual(values=cebpa_colors, labels=labs) +
+      scale_fill_manual(values=ellipse_colors) +
+      scale_y_continuous(breaks = seq(-5,5,by=5)) +
+      xlab("UMAP_1") + ylab("UMAP_2") +
+      labs(title="") +
+      theme_classic() +
+      thm +
+      guides(fill = 'none', color='none') +
+      # guides(color=guide_legend(override.aes = list(size=7)), fill='none') +
+      theme(plot.margin = margin(r = 5, unit="mm"))
+      
+
+# pdf("TARGET_AML_sg6816_UMAP_dim1_2Dscatter.pdf", height = 7, width=10)
+cebpa_dim12
+# dev.off()
+# saveRDS(cebpa_dim12,"TARGET_AML_sg6816_UMAP_dim1_2Dscatter.RDS")
+```
+
+
+```{r fig.height=7, fig.width=20}
+cebpa_dim13 <- ggplot(res,shape=21,
+                      aes(x=x,y=z,color=CEBPA.Double.Single.Allelic.Status)) +
+   stat_ellipse(data=ellipse_dat,
+                   aes(x=x,y=z, fill=CEBPA.Double.Single.Allelic.Status),
+                   geom = "polygon",
+                   size=1.5,
+                   alpha=0.25,
+                   level = 0.75,
+                   inherit.aes = FALSE) +
+      # geom_point(size=3.0,alpha=1,shape=21, stroke = 0.2)+
+      geom_point(size=3.0,alpha=1,shape=19, stroke=0.2)+
+      scale_color_manual(values=cebpa_colors, labels=labs) +
+      scale_fill_manual(values=ellipse_colors) +
+
+      xlab("UMAP_1") + ylab("UMAP_3") +
+      scale_y_continuous(breaks = seq(-5,5,by=5)) +
+      labs(title="") +
+      theme_classic() +
+      thm +
+      theme(legend.text = element_text(size=22),
+            legend.title = element_blank()) +
+      guides(color = guide_legend(override.aes = list(size=7)), fill='none') 
+
+# cebpa_dim13
+
+# pdf("TARGET_AML_sg6816_CEBPA_UMAP_dim123.pdf", height = 7, width = 20)
+grid.arrange(grobs=list(cebpa_dim12,cebpa_dim13),
+             ncol=2, widths=c(1,1.45))
+# dev.off()
+
+# saveRDS(arrangeGrob(grobs=list(cebpa_dim12,cebpa_dim13),
+#              ncol=2, widths=c(1,1.45)), "TARGET_AML_sg6816_CEBPA_UMAP_dim123_2Dscatter.RDS")
+
+```
+
+
+### 3D Plot.ly 
+
+```{r message=FALSE}
+library(plotly)
+```
+
+```{r}
+info <- paste(res$Sample, 
+              paste0("Mutation Category: ",res$Mutations.Category),
+              sep="\n") %>% 
+  ifelse(!is.na(res$Primary.Fusion.CNV), 
+         paste(., paste0("Primary Fusion CNV: ",res$Primary.Fusion.CNV), sep="\n"), .) %>% 
+  ifelse(!is.na(res$Overlap.Mutation.Info),
+         paste(., gsub("/", "\n", res$Overlap.Mutation.Info), sep="\n"), .) %>%
+  gsub("OtherAML","", .) %>%
+  ifelse(!is.na(res$Age.in.years),
+         paste( ., paste("Age:", round(res$Age.in.years,digits = 1),"yrs"), sep="\n"), .) %>%
+  ifelse(!is.na(res$EFS.event.type.ID),
+         paste(., res$EFS.event.type.ID, sep="\n"), .)  %>%
+  gsub("Unknown","",.) %>%
+  set_names(., res$Sample)
+length(info)
+```
+
+```{r fig.width=16}
+textcol <- rgb(0,0,0)
+bgcol <- rgb(1,1,1)
+
+p.cebpa <- plot_ly() %>% 
+  #plot diagnostic and normal samples
+  add_trace(data=res,
+            x = ~x, y = ~y, z = ~z,
+            color = ~CEBPA.Double.Single.Allelic.Status,
+            colors = cebpa_colors,
+            type='scatter3d',
+            mode='markers',
+            text=info,
+            hoverinfo='text',
+            showlegend=TRUE,
+            marker=list(size=4.5,
+                        opacity=0.5),
+                        # line=list(color=col2hex("grey80"),
+                        #           width=0.25)),
+            # line=list(size=1, color=col2rgb("grey80")),
+            inherit = TRUE) %>%
+  # title=list(text="Pediatric AML Clustering By Gene Expression",
+  layout(font = list(color=textcol,
+                                size=10),
+         scene = list(xaxis = list(title = 'UMAP_1',
+                                   color=textcol,
+                                   size=10,
+                                   backgroundcolor=bgcol,
+                                   showbackground=TRUE,
+                                   showgrid=TRUE,
+                                   gridcolor=textcol,
+                                   tickcolor=textcol),
+                     yaxis = list(title = 'UMAP_2',
+                                  color=textcol,
+                                  size=18,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol),
+                     zaxis = list(title = 'UMAP_3',
+                                  color=textcol,
+                                  size=10,
+                                  backgroundcolor=bgcol,
+                                  showbackground=TRUE,
+                                  showgrid=TRUE,
+                                  gridcolor=textcol,
+                                  tickcolor=textcol),
+                     bgcolor=bgcol,
+         legend=list(font=list(size=12, color=textcol),
+                     itemsizing="constant"),
+         plot_bgcolor=bgcol,
+         paper_bgcolor=bgcol))
+ 
+p.cebpa
+```
+
+
+```{r}
+# install.packages("processx")
+orca(p.cebpa,"cebpa_3dscatter.pdf", format = "pdf")
+```
+
+
+```{r}
+htmlwidgets::saveWidget(as_widget(p.cebpa),"TARGET_AML_sg6816_brightCEBPA_PCAselect_3.23.20_ptsize.html", background = bgcol, knitrOptions = list(dpi=1200, 
+fig.height = 15,
+fig.width=15,
+out.width=15, 
+out.height=15))
+```
+
+
+
+### 3D Static
+ 
+```{r}
+# devtools::install_github("AckerDWM/gg3D")
+library(gg3D)
+library(cowplot)
+library(svglite)
+```
+
+```{r fig.height=7, fig.width=10}
+# NOTE: Cannot do the standard 'hacky' way of subsetting your ggplot data and adding the group of interest a second layer, such as to make the points bigger or add stroke etc. 
+# 
+# Instead, use the whole dataset as input for a second layer for a group of interest. Change all unwanted color/fill values to NA. Then set the scale_XXX_disrete/scale_XXXX_manual with na.value=NA and/or with na.translate=FALSE to be transparent. Othersize the axes/rotation do not match up because a new min/max for x,y,z coors are used to draw the axes. 
+
+sm_only <- mutate(ellipse_dat,
+                  sm=ifelse(CEBPA.Double.Single.Allelic.Status=="Single Mutant",
+                            "Single Mutant", NA))
+other_aml <- mutate(res,
+                    aml=ifelse(CEBPA.Double.Single.Allelic.Status %in%
+                        c("No.Primary.Fusion.CNV","AML"), "AML", NA))
+
+  
+theta=-120
+phi=-10
+include_others=TRUE
+#good anlges
+#t=90,phi=10
+#t=-110,phi=-20
+
+
+bgCol <- "white"
+txtCol <- "black"
+
+p <- ggplot(data=ellipse_dat, 
+            mapping=aes(x=x, y=y,z=z, 
+                        # color=CEBPA.Double.Single.Allelic.Status,
+                        fill=CEBPA.Double.Single.Allelic.Status)) +
+    axes_3D(theta=theta, phi=phi, color=txtCol)
+
+rotated <-
+  # if(include_others){
+  p + stat_3D(data=other_aml,
+          aes(x=x, y=y, z=z), color="grey80", #fill=aml
+          geom = "point", theta=theta,phi=phi,
+          shape=19,size=3.0, alpha=0.3,stroke=0, inherit.aes = FALSE)  
+  # }
+  rotated <- rotated + stat_3D(geom = "point", theta=theta,phi=phi,
+          shape=21,size=3.0,
+          color="grey50",
+          stroke=0.2,alpha=0.75) +
+  scale_color_manual(values=cebpa_colors, labels=labs,na.value=NA,
+                     na.translate = FALSE)  +
+  scale_fill_manual(values=cebpa_colors, labels=labs,na.value=NA,
+                     na.translate = FALSE)  +
+  guides(fill=guide_legend(override.aes = list(size=7,
+                                               alpha=1)),
+         color='none') +
+  labs_3D(labs=c("UMAP_1", "UMAP_2", "UMAP_3"),
+    hjust=c(-0.25,-2,-2), vjust=c(10,3.5,31.0),
+    angle=c(0,90,0), size=6, color=txtCol) +
+  labs(title="UMAP Clustering of Pediatric AML \n by Gene Expression") +
+  theme_void() +
+  theme(panel.background = element_rect(color=bgCol, fill=bgCol),
+        plot.title = element_text(hjust=0.5, vjust=0.5, size = 20),
+        legend.text = element_text(size=20),
+        legend.title = element_blank())
+
+rotated
+```
+
+
+```{r}
+output="png"
+ggsave(filename = paste0("TARGET_AML_sg6816_CEBPA_UMAP_FLT3_NPM1_withGreyPoints_brightCEBPA_3Dscatter.",
+                         output),
+       plot=rotated,
+       height = 7, width=10,
+       units="in",
+       dpi=300,
+       device=output)
+
+# saveRDS(rotated,"CEBPA_UMAP_3Dscatter.RDS")
+```
+
+
+cebpa_dim12 <- ggplot(res,
+                      aes(x=x,y=y,color=CEBPA.Double.Single.Allelic.Status)) +
+      stat_ellipse(data=ellipse_dat,
+                   aes(x=x,y=y, fill=CEBPA.Double.Single.Allelic.Status),
+                   geom = "polygon",
+                   size=1.5,
+                   alpha=0.25,
+                   level = 0.75,
+                   inherit.aes = FALSE) +
+      # geom_point(size=3.0,alpha=1,shape=21, stroke = 0.2)+
+      geom_point(size=3.0,alpha=1,shape=19, stroke=0.2)+
+      scale_color_manual(values=cebpa_colors, labels=labs) +
+      scale_fill_manual(values=ellipse_colors) +
+      scale_y_continuous(breaks = seq(-5,5,by=5)) +
+      xlab("UMAP_1") + ylab("UMAP_2") +
+      labs(title="") +
+      theme_classic() +
+      thm +
+      guides(fill = 'none', color='none') +
+      # guides(color=guide_legend(override.aes = list(size=7)), fill='none') +
+      theme(plot.margin = margin(r = 5, unit="mm"))
+      
+
+t=-90
+phi=20
+g1 <- p + 
+  axes_3D(theta=t, phi=phi) +
+    stat_3D(data=filter(res,
+                      CEBPA.Double.Single.Allelic.Status %in%
+                        c("No.Primary.Fusion.CNV","AML")),
+          aes(x=x, y=y, z=z),color="grey80",
+          geom = "point", theta=t,phi=phi, 
+          shape=19, alpha=0.75, inherit.aes = FALSE) +
+  stat_3D(geom = "point", theta=t,phi=phi, 
+          shape=21,size=2.5, stroke=0.2, alpha=0.75) +
+  # stat_ellipse() +
+  scale_fill_manual(values=cebpa_colors, labels=labs)  +
+  guides(fill=guide_legend(override.aes = list(size=7,
+                                               alpha=1)),
+         color='none') +
+  theme_void() 
+  # theme(axis.text. = element_text(size=22, color="black"),
+  #       axis.title = element_text(size=22, color="black"))
+  
+
+
+#TSNE Plot
+
+```{r}
+# tsne<-fftRtsne(X=t(vdata), pca_scale = FALSE, max_iter = 1000,  nthreads=detectCores())
+# 
+# toplot<-data.frame(x=tsne[,1],y=tsne[,2])
+# toplot<-as.data.frame(cbind(toplot, fixed_meta))
+
+
+ggplot(toplot, aes(x=x,y=y,col=Primary_Fusion))+
+  geom_point( size=4)+
+  xlab("UMAP_1") + ylab("UMAP_2")+scale_color_manual(values=cls) -> g1
+m3addon::red_dim_plot(g1)
+```
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

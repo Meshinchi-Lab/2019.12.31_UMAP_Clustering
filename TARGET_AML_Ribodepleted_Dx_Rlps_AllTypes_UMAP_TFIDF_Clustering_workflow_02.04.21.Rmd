@@ -1,0 +1,457 @@
+---
+title: "UMAP Clustering of Ribodepleted RNA-seq"
+author: "Jenny Smith"
+date: "2/11/21"
+output: html_document
+---
+
+#Set-up
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2019.12.31_UMAP_Clustering"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+options(stringsAsFactors = FALSE,bitmapType = 'cairo', device='x11')
+grDevices::X11.options(type='cairo')
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message=FALSE}
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(scales)
+library(RColorBrewer)
+
+
+library(dplyr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(DeGSEA)
+
+getwd()
+```
+
+
+#Read in the Clinical Data
+
+```{r message=FALSE, warning=FALSE}
+merged <- readr::read_csv(file.path(CDE,"Merged/00_Old/TARGET_AML_0531_1031_merged_CDEs_12.09.20.csv"))
+
+merged <- merged %>%
+  filter(USI != "Unknown", !is.na(USI))
+
+dim(merged) #2314  145
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET,"SequencingDataMatrix/00_archive/TARGET_AML_Ribodepleted_Manifest_02.04.21.csv"))
+
+
+dim(sample_info) #3045   15
+head(sample_info)
+
+table(sample_info$Group)
+```
+
+
+#Read in Counts Data
+
+
+```{r eval=FALSE}
+rbd_counts <- readRDS(file.path(PROJHOME,
+                                "0000.00.03_ExpressionMatrices/BCCA_GRCh37_Ensembl_v69/TARGET_AML_MPN_DS_NBM_3044Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+
+IDmap <- rbd_counts[,c(1:2)]
+rbd_counts <- rbd_counts[,-c(1:2)]
+rownames(rbd_counts) <- IDmap[,1]
+
+dim(rbd_counts) #51573  3044
+head(rbd_counts[,1:5])
+```
+
+
+# Select input samples 
+
+
+
+```{r}
+include_samples <- sample_info %>% 
+  filter(!grepl("FLAGGED|FlowSorted", Time_point)) %>% 
+  filter(!grepl("Adult AML (Stirewalt)", Group)) %>% 
+  filter(!grepl("AZA", Sample)) %>% 
+  
+  # filter(grepl("^AML$|NBM|CD34_PB", Group), 
+  filter(grepl("CellLine|diagnostic|NBM|CD34_PB", Time_point)) %>%
+
+  left_join(., select(merged,-one_of(c("Protocol","Primary.CNV","Additional.Fusions.CNV",
+                                       "Primary.Fusion","Group","Reg."))),
+            by="USI") %>% 
+  
+  as.data.frame() %>%
+  set_rownames(.$Sample)
+
+
+
+head(include_samples) #2169  158
+dim(include_samples) #Stella not in the RBD counts?
+# table(include_samples$AML_Subtype)
+```
+
+
+```{r}
+table(include_samples$AML_Subtype) #%>% length() #22 classes still
+table(include_samples$Time_point)
+table(include_samples$Group)
+# write.csv(include_samples,"TARGET_AML_dx_rlps_NBM_sample_info.csv")
+# getwd()
+```
+
+
+# Subset Counts 
+
+```{r}
+keep <- rowSums(rbd_counts >= 10) >= min(table(include_samples$AML_Subtype)) #minimun number of samples in AML_Subtype
+in_counts <- as.matrix(rbd_counts[keep, include_samples$Sample]) 
+
+dim(in_counts) #32258  2176
+head(in_counts[,1:5])
+
+# write.csv(in_counts,"TARGET_AML_dx_rlps_NBM_fractional_counts.csv")
+```
+
+
+#Colors for Plotting
+
+```{r fig.height=2}
+colors37 = c("#466791","#60bf37","#953ada","#4fbe6c","#ce49d3","#a7b43d","#5a51dc","#d49f36","#552095","#507f2d","#db37aa","#84b67c","#a06fda","#df462a","#5b83db","#c76c2d","#4f49a3","#82702d","#dd6bbb","#334c22","#d83979","#55baad","#dc4555","#62aad3","#8c3025","#417d61","#862977","#bba672","#403367","#da8a6d","#a79cd4","#71482c","#c689d0","#6b2940","#d593a7","#895c8b","#bd5975")
+# barplot(rep(1,37), col=colors37, names.arg = colors37, las=2)
+```
+
+```{r fig.height=5, fig.width=10}
+# subtype.levels <- c("AML", 
+#                     "CBFA2T3-GLIS2",
+#                     "CBFB-MYH11", 
+#                     "DEK-NUP214",
+#                     "KMT2A",
+#                     "ETS-Fusion",
+#                     "No.Primary.Fusion",
+#                     "NUP98-KDM5A", 
+#                     "NUP98-NSD1",
+#                     "RBM15-MKL1",
+#                     "RUNX1-RUNX1T1",
+#                     "NBM",
+#                     "CD34_PB")
+
+Cols <- c( "AML_Subtype", "Group","Time_point", "Tissue", "Protocol", "Batch")
+df <- include_samples %>% 
+  select(all_of(Cols)) 
+  # mutate(AML_Subtype=factor(AML_Subtype, levels=subtype.levels))
+
+cc <- colorCodes_aheatmap(df=df)
+
+
+cc$AML_Subtype <- brewer.pal(12,"Paired") %>% 
+  c(., c("darkslategray3","#984EA3","firebrick1",  "seagreen2", "cornflowerblue","chartreuse1")) %>% 
+  set_names(grep("NBM|CD34", unique(include_samples$AML_Subtype), invert = T, value=T))
+
+cc$AML_Subtype["NBM"] <- "grey80"
+cc$AML_Subtype["CD34_PB"] <- "grey90"
+cc$AML_Subtype["No.Primary.Fusion"] <- "cornsilk"
+cc$AML_Subtype["AML, NOS"] <- "bisque3"
+# cc$AML_Subtype["KMT2A"]<- "khaki2"
+# cc$AML_Subtype["NUP98-KDM5A"] <- "orchid"
+
+
+par(mar=c(10,10,10,10))
+barplot(rep(1, length(cc$AML_Subtype)),col=cc$AML_Subtype, las=2, names.arg = names(cc$AML_Subtype))
+```
+
+
+
+
+# UMAP Projection 
+
+```{r}
+sample_total <- apply(in_counts, 2, sum)
+geomean <- exp(mean(log(sample_total)))
+sf <- sample_total/geomean
+sf.scaled <- t(t(in_counts)/sf)
+
+dim(sf.scaled)
+```
+
+
+## TF-IDF 
+
+```{r}
+
+TFIDF <-  seqGlue::tf_idf_transform(sf.scaled)
+TFIDF <- as.matrix(TFIDF)
+
+head(TFIDF[,1:5])
+dim(TFIDF) 
+range(TFIDF) 
+```
+
+
+## Input Feature selection 
+
+
+
+```{r message=FALSE}
+library(DelayedArray)
+# Mean vs Dispersion Feature Selection 
+disp_trend_obj <- seqGlue::calc_dispersion(sf.scaled, 
+                                  removeOutliers = TRUE) #removes outlier 
+
+input_genes <- seqGlue::get_selected_genes(seqGlue::select_genes(disp_trend_obj, top_n=NULL))
+length(input_genes)  #6634
+```
+
+```{r}
+pca_res <- run_jackstraw(TFIDF_Matrix = log2(sf.scaled+1)[,])
+
+# saveRDS(pca_res,"TARGET_AML_NBM_AllDifferentTypes_diagnostic_allSampleTypes_2.4.21.RDS")
+str(pca_res) #100 PCs uses.
+length(pca_res$input_features) #32257 what??? why is it selecting sooo many genes??
+
+# pca_umap_orig <- readRDS("Results/DX_DS_MPN_JMML_MDA_APL_Samples/TARGET_AML_NBM_AllDifferentTypes_diagnostic_allSampleTypes_2.4.21.RDS")
+
+# dx_umap_orig
+```
+
+
+NOTE: Using Ntop=2000 causes JMML to be a distint cluster, while using all 
+## Run the workflow
+
+```{r}
+#columns to use for plotting
+Cols <- c( "AML_Subtype", "Group","Time_point", "Tissue", "Protocol", "Batch")
+
+#n_neighbors:  Larger values result in more global views of the manifold, while smaller values result in more local data being preserved.
+
+# min_dist: Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points.
+
+dx_umap <- UMAP_workflow(TFIDF_Matrix = TFIDF,
+                              input_features = input_genes,
+                              samples_vector = pull(include_samples,Sample), 
+                              sample_info_df = include_samples, 
+                              cc=cc, 
+                              min_dist = 0.1,
+                              n_neighbors=30,
+                              k2=15,res2=0.01,
+                              scale_data=FALSE,
+                              Columns_for_Plots = Cols,
+                              addl_color_vector = colors37)
+```
+
+ Good Settings:
+
+1) 
+top 2000 genes by MvD trend only
+min_dist = 0.025,
+n_neighbors=25,
+
+2)
+top 2000 genes by MvD trend only
+min_dist = 0.02,
+n_neighbors=40,
+
+3)
+all 6634 genes by MvD trend only
+min_dist=0.00125
+n_neighbors=27
+
+
+Ugh I hard coded the damn scatterplot columns for some reason, now I need to fix that too. 
+
+hmmm - supervised nearest centroids (PAM) for the gene selection??
+
+```{r fig.height=10, fig.width=10}
+dx_umap$umap_2D_scatter[[1]]
+# dx_umap$cluster_plots2
+```
+
+
+### 3D Plot.ly 
+
+```{r message=FALSE}
+library(plotly)
+```
+
+```{r}
+scatter3d <- scatter_plots_3d(umap_workflow_res = dx_umap, 
+                              Group_Column = "AML_Subtype",
+                              Cols = c("Sample","Primary.Fusion","Age.in.years","Overlap.Mutation.Info","EFS.event.type.ID"),
+                              cc = cc$AML_Subtype,
+                              blackbg = TRUE,
+                              ptsize = 3)
+```
+
+
+```{r fig.height=10, fig.width=10}
+scatter3d
+```
+
+```{r}
+bgcol <- rgb(0,0,0)
+htmlwidgets::saveWidget(as_widget(scatter3d),
+                        "TARGET_AML_NBM_JMML_APL_DS_TMD_Models__2UMAP_3Dscatter.html",
+                        selfcontained = TRUE,
+                        background = bgcol,
+                        knitrOptions = list(dpi=1200, 
+                                            fig.height = 15,
+                                            fig.width=15,
+                                            out.width=15, 
+                                            out.height=15))
+```
+
+
+```{r}
+scatter_plots_3d <- function(umap_workflow_res, 
+                             Group_Column=NULL,
+                             Cols=NULL,
+                             cc=NULL,
+                             add_count=0,
+                             blackbg=TRUE,
+                             ptsize=4){
+  #NOTE: there must be a column for sample IDs called "Sample" in the umap results
+  
+  
+  suppressPackageStartupMessages(library(plotly))
+  library(RColorBrewer)
+  suppressPackageStartupMessages(library(tidyr))
+  library(dplyr)
+  
+  #re-arrange the umap results dataframe based on the groups of interest
+  res <- umap_workflow_res$umap_res %>% 
+    arrange(Group_Column)
+  
+  # Cols <- c("Sample", "Primary.Fusion","Age.in.years","EFS.event.type.ID","Time_point","Overlap.Mutation.Info")
+  
+  #Create a vector with sample information that will be presented when arrow hovers over the point
+  if(!is.null(Cols)){
+    if (all(Cols %in% colnames(res))){
+      
+      info_df <- select(res,one_of(Cols)) %>%
+        mutate_if(is.numeric, ~round(., digits=2))
+      
+      
+      info <- gather(info_df,"Col","Value",-one_of("Sample")) %>%
+        mutate_at(vars(Value), ~paste0(Col, ": ", .)) %>%
+        spread(Col, Value) %>%
+        unite("hover_statement",sep="\n",na.rm = F,remove = F)  %>%
+        pull(hover_statement, name=Sample)
+      
+      #re-order the hover information
+      info <- info[res$Sample]
+      
+    }else{
+      message(paste("Must have colnames: ", Cols,"in your dataset."))
+    }
+  }
+  
+  #define colors for the umap plot based on the number of levels of the groups of interest
+  if(is.null(cc)){
+    #select the cluster column with the most number of clusters
+    groups <- unique(res[[Group_Column]])
+    n <- length(groups)
+    cc <- c(brewer.pal(n=9,"Set1"),brewer.pal(n=8,"Set2"), brewer.pal(n=9,"Pastel1"))[1:n]
+    #adding the names argument is actually the problem??? when you set the name its not mapping the colors to factor levels of the column used for the colors?
+    #this used to work but no longer as far as I can tell. Instead colors are simple applied to the order of the factor levels, regardless of being a named vector. 
+  }
+  
+  #whether to set a black backgroup color or not. 
+  if(blackbg){
+    textcol <- rgb(1,1,1)
+    bgcol <- rgb(0,0,0)
+  }else{
+    textcol <- rgb(0,0,0)
+    bgcol <- rgb(1,1,1)
+  }
+  
+  print("this func")
+  
+  #add a count to the axes if they are too close together
+  expand_coords <- function(x,y){ifelse(x>0, x+y, x-y)}
+  ranges <- lapply(res[,c("x","y","z")], range)
+  ranges <- lapply(ranges, expand_coords,y=add_count)
+  
+  #plot the umap results
+  colorCol <- as.formula(paste("~",Group_Column))
+  p <- plot_ly() %>% 
+    
+    add_trace(data=res,
+              x = ~x, y = ~y, z = ~z,
+              color = colorCol, 
+              colors = cc, 
+              type='scatter3d',
+              mode='markers',
+              text=info,
+              hoverinfo='text',
+              showlegend=TRUE,
+              marker=list(size=ptsize,
+                          opacity=0.7),
+              inherit = TRUE) %>%
+    layout(font = list(color=textcol,
+                       size=18),
+           scene = list(xaxis = list(title = 'UMAP_1',
+                                     color=textcol,
+                                     range=ranges$x,
+                                     size=18,
+                                     backgroundcolor=bgcol,
+                                     showbackground=TRUE,
+                                     showgrid=TRUE,
+                                     gridcolor=textcol,
+                                     tickcolor=textcol),
+                        yaxis = list(title = 'UMAP_2',
+                                     color=textcol,
+                                     range=ranges$y,
+                                     size=18,
+                                     backgroundcolor=bgcol,
+                                     showbackground=TRUE,
+                                     showgrid=TRUE,
+                                     gridcolor=textcol,
+                                     tickcolor=textcol),
+                        zaxis = list(title = 'UMAP_3',
+                                     color=textcol,
+                                     range=ranges$z,
+                                     size=18,
+                                     backgroundcolor=bgcol,
+                                     showbackground=TRUE,
+                                     showgrid=TRUE,
+                                     gridcolor=textcol,
+                                     tickcolor=textcol),
+                        bgcolor=bgcol),
+                        legend=list(font=list(size=18, color=textcol),
+                                    itemsizing="trace",
+                                    bgcolor=bgcol,
+                                    bordercolor=textcol),
+                        plot_bgcolor=bgcol,
+                        paper_bgcolor=bgcol) %>% 
+    config(setBackground=bgcol)
+  
+  return(p)
+}
+```
+
+
+
+
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
